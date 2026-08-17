@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- AAuth: tolerate absent `keyid` (RFC 9421 makes it optional; the key comes from
+  the token's `cnf.jwk`). Exposed by cross-library interop with
+  christian-posta/aauth-signing, whose signers correctly omit it; that signer's
+  exact keyid-less shape is now pinned in CI.
+
 ## 0.1.0
 
 Initial release, extracted from Regent Protocol's production marketplace

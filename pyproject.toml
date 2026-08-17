@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "regent-httpsig"
-version = "0.1.0"
+version = "0.1.1"
 description = "Verify and sign AI agent HTTP traffic in Python — RFC 9421 HTTP Message Signatures: Web Bot Auth (what OpenAI ships) and AAuth."
 readme = "README.md"
 license = "Apache-2.0"
