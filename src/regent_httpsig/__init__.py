@@ -11,7 +11,7 @@ from regent_httpsig.sfv import parse_signature_agent
 from regent_httpsig.sign import DIRECTORY_MEDIA_TYPE, EgressSigner, generate_seed
 from regent_httpsig.verify import WBA_TAG, HttpsigVerifier, VerifiedSignature
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "DIRECTORY_MEDIA_TYPE",

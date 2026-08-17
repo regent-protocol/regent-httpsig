@@ -197,6 +197,115 @@ async def test_aauth_without_keyid_param(monkeypatch: pytest.MonkeyPatch) -> Non
     assert sig is not None and sig.scheme == "aauth" and sig.sub == "agent-42"
 
 
+def _issuer_pair(kid: str = "iss-1", alg: str = "EdDSA"):
+    priv = Ed25519PrivateKey.generate()
+    jwk = {"kty": "OKP", "crv": "Ed25519", "kid": kid, "alg": alg,
+           "x": b64url(priv.public_key().public_bytes_raw())}
+    return priv, jwk
+
+
+def _mint(issuer_priv, *, typ: str, alg: str, claims: dict) -> str:
+    from regent_httpsig.verify import _register_fully_specified_algs
+
+    _register_fully_specified_algs()
+    return pyjwt.encode(claims, issuer_priv, algorithm=alg,
+                        headers={"typ": typ, "kid": "iss-1"})
+
+
+class TestFullySpecifiedAlgs:
+    """AAuth -11 / RFC 9864: Ed25519 accepted; polymorphic EdDSA gated by config."""
+
+    async def _roundtrip(self, alg: str, config: HttpsigConfig,
+                         monkeypatch: pytest.MonkeyPatch):
+        issuer_priv, issuer_jwk = _issuer_pair(alg=alg)
+        agent = EgressSigner(seed=generate_seed(), signature_agent="https://issuer.example")
+        now = int(time.time())
+        token = _mint(issuer_priv, typ="aa-agent+jwt", alg=alg, claims={
+            "iss": "https://issuer.example", "sub": "a-1", "iat": now, "exp": now + 600,
+            "dwk": "aauth-agent.json",
+            "cnf": {"jwk": {**agent.public_jwk, "alg": "Ed25519"}},
+        })
+        url = "https://api.example/v1/x"
+        headers = agent.sign("POST", url, {"Host": "api.example"})
+        headers["Signature-Key"] = f'sig1=jwt;jwt="{token}"'
+        verifier = HttpsigVerifier(config)
+        monkeypatch.setattr(verifier, "_fetch_json", _mock_fetch({
+            "https://issuer.example/.well-known/aauth-agent.json":
+                {"jwks_uri": "https://issuer.example/j"},
+            "https://issuer.example/j": {"keys": [issuer_jwk]},
+        }))
+        return await verifier.verify("POST", url, headers)
+
+    async def test_ed25519_fully_specified_verifies(self, monkeypatch) -> None:
+        sig = await self._roundtrip("Ed25519", HttpsigConfig(), monkeypatch)
+        assert sig is not None and sig.scheme == "aauth"
+
+    async def test_eddsa_accepted_in_transition_mode(self, monkeypatch) -> None:
+        sig = await self._roundtrip("EdDSA", HttpsigConfig(), monkeypatch)
+        assert sig is not None  # default: -10 ecosystem still accepted
+
+    async def test_eddsa_rejected_in_strict_mode(self, monkeypatch) -> None:
+        strict = HttpsigConfig(require_fully_specified_algs=True)
+        assert await self._roundtrip("EdDSA", strict, monkeypatch) is None
+
+    async def test_ed25519_verifies_in_strict_mode(self, monkeypatch) -> None:
+        strict = HttpsigConfig(require_fully_specified_algs=True)
+        sig = await self._roundtrip("Ed25519", strict, monkeypatch)
+        assert sig is not None
+
+
+class TestPersonTokens:
+    """AAuth -11 person tokens: PS-issued, per-resource aud, cnf-bound, ≤1h."""
+
+    def _headers(self, *, aud: str, lifetime: int = 600):
+        ps_priv, ps_jwk = _issuer_pair()
+        agent = EgressSigner(seed=generate_seed(), signature_agent="https://ps.example")
+        now = int(time.time())
+        token = _mint(ps_priv, typ="aa-person+jwt", alg="Ed25519", claims={
+            "iss": "https://ps.example", "sub": "directed-sub-1", "aud": aud,
+            "iat": now, "exp": now + lifetime, "dwk": "aauth-person.json",
+            "jti": "pt-1", "cnf": {"jwk": {**agent.public_jwk, "alg": "Ed25519"}},
+        })
+        url = "https://api.example/v1/x"
+        headers = agent.sign("POST", url, {"Host": "api.example"})
+        headers["Signature-Key"] = f'sig1=jwt;jwt="{token}"'
+        return url, headers, ps_jwk
+
+    def _verifier(self, ps_jwk, monkeypatch, **cfg):
+        verifier = HttpsigVerifier(HttpsigConfig(**cfg))
+        monkeypatch.setattr(verifier, "_fetch_json", _mock_fetch({
+            "https://ps.example/.well-known/aauth-person.json":
+                {"jwks_uri": "https://ps.example/j"},
+            "https://ps.example/j": {"keys": [ps_jwk]},
+        }))
+        return verifier
+
+    async def test_person_token_roundtrip(self, monkeypatch) -> None:
+        url, headers, ps_jwk = self._headers(aud="https://api.example")
+        v = self._verifier(ps_jwk, monkeypatch, resource_url="https://api.example")
+        sig = await v.verify("POST", url, headers)
+        assert sig is not None
+        assert sig.scheme == "aauth-person"
+        assert sig.agent == "https://ps.example"  # the PS, not the agent operator
+        assert sig.sub == "directed-sub-1"
+        assert sig.claims.get("jti") == "pt-1"
+
+    async def test_person_token_wrong_audience_rejected(self, monkeypatch) -> None:
+        url, headers, ps_jwk = self._headers(aud="https://OTHER.example")
+        v = self._verifier(ps_jwk, monkeypatch, resource_url="https://api.example")
+        assert await v.verify("POST", url, headers) is None
+
+    async def test_person_token_disabled_without_resource_url(self, monkeypatch) -> None:
+        url, headers, ps_jwk = self._headers(aud="https://api.example")
+        v = self._verifier(ps_jwk, monkeypatch)  # no resource_url → path disabled
+        assert await v.verify("POST", url, headers) is None
+
+    async def test_person_token_overlong_lifetime_rejected(self, monkeypatch) -> None:
+        url, headers, ps_jwk = self._headers(aud="https://api.example", lifetime=7200)
+        v = self._verifier(ps_jwk, monkeypatch, resource_url="https://api.example")
+        assert await v.verify("POST", url, headers) is None
+
+
 async def test_cache_is_per_instance() -> None:
     a, b = HttpsigVerifier(), HttpsigVerifier()
     a._cache_put("https://x.example/doc", {"keys": []}, ttl=60)

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0
+
+AAuth draft **-11** support (per the editor's copy, ahead of datatracker publication):
+
+- **Fully-specified algorithms (RFC 9864):** `Ed25519` accepted everywhere
+  (registered with PyJWT, including JWKS entries PyJWK cannot parse).
+  New `HttpsigConfig.require_fully_specified_algs` enforces the -11 MUST NOT on
+  the polymorphic `EdDSA`; the default keeps accepting it while the -10
+  ecosystem migrates, and will flip when -11 posts.
+- **Person tokens** (`typ: aa-person+jwt`): PS-issued, per-resource `aud`,
+  `cnf`-bound, ≤1h lifetime — verified via `{iss}/.well-known/aauth-person.json`.
+  Opt-in: set `HttpsigConfig.resource_url` (the token's `aud` must name it).
+  Result scheme: `"aauth-person"`, `sub` = the PS's directed user identifier.
+- Strict mode also enforces the -11 requirement that `cnf.jwk` carries a
+  fully-specified `alg` member.
+
 ## 0.1.1
 
 - AAuth: tolerate absent `keyid` (RFC 9421 makes it optional; the key comes from

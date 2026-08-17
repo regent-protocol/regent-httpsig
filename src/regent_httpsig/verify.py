@@ -55,7 +55,23 @@ logger = logging.getLogger("regent_httpsig")
 WBA_TAG = "web-bot-auth"
 WBA_DIRECTORY_PATH = "/.well-known/http-message-signatures-directory"
 AAUTH_METADATA_PATH = "/.well-known/aauth-agent.json"
+AAUTH_PERSON_METADATA_PATH = "/.well-known/aauth-person.json"
 AAUTH_JWT_TYP = "aa-agent+jwt"
+AAUTH_PERSON_TYP = "aa-person+jwt"
+# -11: a person token "lives at most one hour" — enforced with a small tolerance.
+PERSON_TOKEN_MAX_LIFETIME = 3600 + 90
+
+
+def _register_fully_specified_algs() -> None:
+    """Register 'Ed25519' (RFC 9864 fully-specified) with PyJWT — same math as
+    the polymorphic 'EdDSA', which AAuth -11 forbids implementations to accept."""
+    import contextlib
+
+    import jwt as pyjwt
+    from jwt.algorithms import OKPAlgorithm
+
+    with contextlib.suppress(ValueError):  # already registered = fine
+        pyjwt.register_algorithm("Ed25519", OKPAlgorithm())
 
 
 @dataclass
@@ -286,22 +302,47 @@ class HttpsigVerifier:
             return None
         label, token = parsed
 
+        _register_fully_specified_algs()
         try:
             header = pyjwt.get_unverified_header(token)
             unverified = pyjwt.decode(token, options={"verify_signature": False})
         except Exception:  # noqa: BLE001
             return None
-        if header.get("typ") != AAUTH_JWT_TYP or header.get("alg") in (None, "none"):
+        if header.get("alg") in (None, "none"):
             return None
+
+        # -11 token-type dispatch: agent tokens (identity mode) and person tokens
+        # (PS-issued, per-resource, opt-in via config.resource_url).
+        typ = header.get("typ")
+        if typ == AAUTH_JWT_TYP:
+            scheme, expected_dwk = "aauth", "aauth-agent.json"
+            metadata_path, audience = AAUTH_METADATA_PATH, None
+        elif typ == AAUTH_PERSON_TYP:
+            if not self.config.resource_url:
+                logger.info("person token presented but config.resource_url is not "
+                            "set — person-token verification is disabled")
+                return None
+            scheme, expected_dwk = "aauth-person", "aauth-person.json"
+            metadata_path, audience = AAUTH_PERSON_METADATA_PATH, self.config.resource_url
+        else:
+            return None
+
         iss = str(unverified.get("iss", ""))
-        bad_iss = unverified.get("dwk") != "aauth-agent.json" or not iss.startswith("https://")
+        bad_iss = unverified.get("dwk") != expected_dwk or not iss.startswith("https://")
         if bad_iss and not (
             iss and urlsplit(iss).hostname in self.config.insecure_hosts  # dev escape
         ):
             return None
 
-        # 1) Verify the agent_token against the issuer's published JWKS.
-        metadata = await self._fetch_json(iss.rstrip("/") + AAUTH_METADATA_PATH)
+        # AAuth -11 / RFC 9864: fully-specified algorithms. "EdDSA" (polymorphic)
+        # is accepted only while require_fully_specified_algs is False — a
+        # transition affordance for the -10 ecosystem.
+        allowed_algs = ["Ed25519", "ES256", "RS256"]
+        if not self.config.require_fully_specified_algs:
+            allowed_algs.append("EdDSA")
+
+        # 1) Verify the token against the issuer's published JWKS.
+        metadata = await self._fetch_json(iss.rstrip("/") + metadata_path)
         if not metadata or not metadata.get("jwks_uri"):
             return None
         jwks = await self._fetch_json(str(metadata["jwks_uri"]))
@@ -314,23 +355,45 @@ class HttpsigVerifier:
                     issuer_key = pyjwt.PyJWK(k).key
                     break
                 except Exception:  # noqa: BLE001
-                    continue
+                    # PyJWK's internal registry predates RFC 9864 names — a JWKS
+                    # advertising alg "Ed25519" is valid in -11 but unknown to it.
+                    try:
+                        issuer_key = load_ed25519_jwk(k)
+                        break
+                    except ValueError:
+                        continue
         if issuer_key is None:
             return None
         try:
             claims = pyjwt.decode(
                 token,
                 key=issuer_key,
-                algorithms=["EdDSA", "ES256", "RS256"],
-                options={"require": ["iss", "sub", "exp", "iat"]},
+                algorithms=allowed_algs,
+                audience=audience,
+                options={
+                    "require": ["iss", "sub", "exp", "iat"],
+                    "verify_aud": audience is not None,
+                },
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("aauth token invalid iss=%s: %s", iss, str(exc)[:200])
             return None
 
+        # -11: a person token "lives at most one hour".
+        if typ == AAUTH_PERSON_TYP:
+            lifetime = int(claims.get("exp", 0)) - int(claims.get("iat", 0))
+            if lifetime <= 0 or lifetime > PERSON_TOKEN_MAX_LIFETIME:
+                logger.info("person token lifetime %ss out of bounds iss=%s", lifetime, iss)
+                return None
+
         # 2) Proof of possession: the request signature must verify against cnf.jwk.
         cnf_jwk = (claims.get("cnf") or {}).get("jwk")
         if not isinstance(cnf_jwk, dict):
+            return None
+        # -11 strict mode: the cnf JWK "MUST carry a fully-specified alg member".
+        if self.config.require_fully_specified_algs and cnf_jwk.get("alg") != "Ed25519":
+            logger.info("cnf.jwk alg %r is not fully-specified iss=%s",
+                        cnf_jwk.get("alg"), iss)
             return None
         try:
             pop_key = load_ed25519_jwk(cnf_jwk)
@@ -357,11 +420,15 @@ class HttpsigVerifier:
             return None
 
         return VerifiedSignature(
-            scheme="aauth",
+            scheme=scheme,
             agent=iss,
             keyid=jwk_thumbprint(cnf_jwk),
             trusted=iss in self.config.trusted_agents,
             sub=str(claims.get("sub", "")),
             label=label,
-            claims={k: claims[k] for k in ("iss", "sub", "exp", "ps") if k in claims},
+            claims={
+                k: claims[k]
+                for k in ("iss", "sub", "exp", "ps", "aud", "jti", "mission_s256")
+                if k in claims
+            },
         )

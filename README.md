@@ -101,6 +101,9 @@ keyid-less shape is pinned in CI.
 - **AAuth** (`draft-hardt-oauth-aauth-protocol`, identity-based mode): the agent carries a
   JWT `agent_token` in `Signature-Key`; the issuer's JWKS verifies the token, the token's
   `cnf.jwk` verifies the request signature. Install with `pip install 'regent-httpsig[aauth]'`.
+  Tracks the **-11 editor's copy**: fully-specified algorithms (RFC 9864, `Ed25519` — with a
+  transition flag for the -10 ecosystem's `EdDSA`) and **person tokens** (`aa-person+jwt`,
+  opt-in via `HttpsigConfig.resource_url`).
   For a full-protocol AAuth implementation (both roles, all token types) see
   [christian-posta/aauth-python-library](https://github.com/christian-posta/aauth-python-library) —
   this library is the thin relying-party verifier that handles both dialects.

@@ -30,3 +30,11 @@ class HttpsigConfig:
     # Hosts exempt from the https-only + public-IP SSRF guard (local dev only —
     # e.g. frozenset({"localhost"})). Leave empty in production.
     insecure_hosts: frozenset[str] = field(default_factory=frozenset)
+    # AAuth -11 (editor's copy): JOSE algs must be fully-specified per RFC 9864 —
+    # implementations MUST NOT accept the polymorphic "EdDSA". True enforces that;
+    # the False default keeps accepting "EdDSA" while the -10 ecosystem migrates.
+    require_fully_specified_algs: bool = False
+    # This service's public URL (e.g. "https://api.example"). Required to accept
+    # AAuth person tokens — their `aud` must name this resource. None disables
+    # the person-token path entirely.
+    resource_url: str | None = None
