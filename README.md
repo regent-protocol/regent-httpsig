@@ -71,12 +71,20 @@ and every Web Bot Auth verifier on the internet can now identify your agent.
 | Web Bot Auth A.2.3 — legacy sf-string form (**what OpenAI ships in production**) | ✅ in CI |
 | Sign → verify roundtrip (fresh keys, full pipeline) | ✅ in CI |
 | AAuth identity-mode roundtrip (`aa-agent+jwt` + `cnf.jwk` proof of possession) | ✅ in CI |
+| Signed by [`aauth-signing`](https://github.com/christian-posta/aauth-python-library) (jwt scheme, keyid-less) → verified | ✅² |
 | Tampered request / expired signature / wrong directory key rejected | ✅ in CI |
 
 ¹ The signature bytes printed in the draft's own A.2.2 example do **not** verify over the
 draft's own signature base (the legacy A.2.3 vector and RFC 9421 B.2.6 both do, so the defect
 is in the example, not the canonicalization). Ed25519 is deterministic, so our test pins the
 vector re-signed with the same RFC test key over the same byte-exact base — reported upstream.
+
+² Cross-library interop with `aauth-signing`'s jwt scheme: token layer, `cnf.jwk` proof of
+possession and canonicalization all verify. Its signers correctly omit the optional `keyid`
+parameter — which exposed an unconditional `keyid` read in the underlying RFC 9421 library
+that we now handle. One deviation reported upstream to `aauth-signing`: it emits the
+`Signature` byte sequence as base64url, while RFC 8941 requires standard base64. The
+keyid-less shape is pinned in CI.
 
 ## Both dialects, one verifier
 
