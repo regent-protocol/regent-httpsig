@@ -84,6 +84,31 @@ class VerifiedSignature:
         return out
 
 
+class _KeyidOptionalParams(dict):  # type: ignore[type-arg]
+    """RFC 9421 makes ``keyid`` OPTIONAL, but the upstream verifier reads
+    ``params["keyid"]`` unconditionally. On the AAuth path the key comes from
+    the token's ``cnf.jwk``, so conforming signers (e.g. aauth-signing) omit
+    keyid entirely. Returning None for a missing keyid routes resolution to our
+    StaticKeyResolver default WITHOUT adding the key to the params — iteration
+    is unchanged, so the reconstructed signature base stays byte-identical."""
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "keyid" and key not in self:
+            return None
+        return super().__getitem__(key)
+
+
+class _KeyidOptionalVerifier(HTTPMessageVerifier):
+    def _verify_one(self, *, label: Any, sig_input: Any, signature: Any,
+                    message: Any, max_age: Any) -> Any:
+        if "keyid" not in sig_input.params:
+            sig_input.params = _KeyidOptionalParams(sig_input.params)
+        return super()._verify_one(  # type: ignore[no-untyped-call]
+            label=label, sig_input=sig_input, signature=signature,
+            message=message, max_age=max_age,
+        )
+
+
 def _keys_from_jwks(doc: dict[str, Any]) -> dict[str, Ed25519PublicKey]:
     keys: dict[str, Ed25519PublicKey] = {}
     for jwk in list(doc.get("keys") or [])[:10]:
@@ -311,7 +336,7 @@ class HttpsigVerifier:
             pop_key = load_ed25519_jwk(cnf_jwk)
         except ValueError:
             return None
-        verifier = HTTPMessageVerifier(
+        verifier = _KeyidOptionalVerifier(
             signature_algorithm=ED25519,
             key_resolver=StaticKeyResolver({}, default=pop_key),
             component_resolver_class=DictKeyComponentResolver,

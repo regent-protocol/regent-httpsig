@@ -142,6 +142,61 @@ async def test_aauth_expired_token_rejected(monkeypatch: pytest.MonkeyPatch) -> 
     assert await verifier.verify("POST", url, headers) is None
 
 
+async def test_aauth_without_keyid_param(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RFC 9421 makes keyid OPTIONAL; on the AAuth path the key comes from the
+    token's cnf.jwk, so conforming signers (e.g. christian-posta/aauth-signing)
+    omit it. Pins the interop shape: signature built WITHOUT keyid must verify."""
+    import base64
+
+    agent_priv = Ed25519PrivateKey.generate()
+    agent_jwk = {"kty": "OKP", "crv": "Ed25519",
+                 "x": b64url(agent_priv.public_key().public_bytes_raw())}
+    issuer_priv = Ed25519PrivateKey.generate()
+    issuer_jwk = {
+        "kty": "OKP", "crv": "Ed25519", "kid": "iss-1", "alg": "EdDSA",
+        "x": b64url(issuer_priv.public_key().public_bytes_raw()),
+    }
+    now = int(time.time())
+    token = pyjwt.encode(
+        {"iss": "https://issuer.example", "sub": "agent-42", "iat": now,
+         "exp": now + 600, "dwk": "aauth-agent.json", "cnf": {"jwk": agent_jwk}},
+        issuer_priv, algorithm="EdDSA",
+        headers={"typ": "aa-agent+jwt", "kid": "iss-1"},
+    )
+
+    # Build the signature exactly the way aauth-signing does: covered components
+    # @method/@authority/@path/signature-key, created only — NO keyid param.
+    sig_key_header = f'sig=jwt;jwt="{token}"'
+    params = ('("@method" "@authority" "@path" "signature-key")'
+              f";created={now}")
+    base = "\n".join([
+        '"@method": POST',
+        '"@authority": api.example',
+        '"@path": /v1/orders',
+        f'"signature-key": {sig_key_header}',
+        f'"@signature-params": {params}',
+    ]).encode()
+    signature = base64.b64encode(agent_priv.sign(base)).decode()
+    headers = {
+        "Host": "api.example",
+        "Signature-Key": sig_key_header,
+        "Signature-Input": f"sig={params}",
+        "Signature": f"sig=:{signature}:",
+    }
+
+    verifier = HttpsigVerifier()
+    monkeypatch.setattr(
+        verifier, "_fetch_json",
+        _mock_fetch({
+            "https://issuer.example/.well-known/aauth-agent.json":
+                {"jwks_uri": "https://issuer.example/jwks.json"},
+            "https://issuer.example/jwks.json": {"keys": [issuer_jwk]},
+        }),
+    )
+    sig = await verifier.verify("POST", "https://api.example/v1/orders", headers)
+    assert sig is not None and sig.scheme == "aauth" and sig.sub == "agent-42"
+
+
 async def test_cache_is_per_instance() -> None:
     a, b = HttpsigVerifier(), HttpsigVerifier()
     a._cache_put("https://x.example/doc", {"keys": []}, ttl=60)
