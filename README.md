@@ -42,6 +42,12 @@ signature yields `None`, and nothing ever raises on untrusted input. Use
 `regent_httpsig.fastapi.RequiredSignatureDep` when a signature must be present — the 401
 tells the agent exactly how to sign.
 
+> **Behind a reverse proxy?** The agent signed the *public* URL
+> (`https://api.example/…`), but your ASGI server sees `http://container/…`. The FastAPI
+> dependency rebuilds the signed URL from `X-Forwarded-Proto` + `Host`, so make sure your
+> proxy forwards the scheme — nginx: `proxy_set_header X-Forwarded-Proto $scheme;`.
+> If signatures mysteriously fail to verify in production, check this first.
+
 ## Sign: get your agent past bot walls
 
 ```python
