@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "regent-httpsig"
+version = "0.1.0"
+description = "Verify and sign AI agent HTTP traffic in Python — RFC 9421 HTTP Message Signatures: Web Bot Auth (what OpenAI ships) and AAuth."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Regent Protocol", email = "info@regentprotocol.org" }]
+keywords = [
+    "rfc9421", "http-message-signatures", "web-bot-auth", "aauth",
+    "ai-agents", "agent-identity", "bot-detection", "ed25519",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Security :: Cryptography",
+    "Typing :: Typed",
+]
+dependencies = [
+    "cryptography>=42",
+    # typing_extensions: http-message-signatures 2.0.1 imports it but forgets to
+    # declare it — we declare it so installs never break.
+    "http-message-signatures>=2.0.1",
+    "typing_extensions>=4.10",
+    "httpx>=0.25",
+]
+
+[project.optional-dependencies]
+aauth = ["pyjwt>=2.8.0"]
+fastapi = ["fastapi>=0.100"]
+
+[project.urls]
+Homepage = "https://github.com/regent-protocol/regent-httpsig"
+Repository = "https://github.com/regent-protocol/regent-httpsig"
+Issues = "https://github.com/regent-protocol/regent-httpsig/issues"
+
+[project.scripts]
+regent-httpsig = "regent_httpsig.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/regent_httpsig"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pyjwt>=2.8.0",
+    "fastapi>=0.100",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["http_message_signatures.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
