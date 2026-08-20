@@ -58,7 +58,8 @@ AAUTH_METADATA_PATH = "/.well-known/aauth-agent.json"
 AAUTH_PERSON_METADATA_PATH = "/.well-known/aauth-person.json"
 AAUTH_JWT_TYP = "aa-agent+jwt"
 AAUTH_PERSON_TYP = "aa-person+jwt"
-# -11: a person token "lives at most one hour" — enforced with a small tolerance.
+AAUTH_AUTH_TYP = "aa-auth+jwt"  # PS-issued auth tokens — the budget carrier
+# -11: person and auth tokens live at most one hour — enforced with tolerance.
 PERSON_TOKEN_MAX_LIFETIME = 3600 + 90
 
 
@@ -311,9 +312,11 @@ class HttpsigVerifier:
         if header.get("alg") in (None, "none"):
             return None
 
-        # -11 token-type dispatch: agent tokens (identity mode) and person tokens
-        # (PS-issued, per-resource, opt-in via config.resource_url).
+        # -11 token-type dispatch: agent tokens (identity mode), person tokens
+        # (PS-issued, per-resource, opt-in via config.resource_url) and auth
+        # tokens (PS-issued budget carriers, opt-in via config.trusted_ps).
         typ = header.get("typ")
+        jwks_override: str | None = None
         if typ == AAUTH_JWT_TYP:
             scheme, expected_dwk = "aauth", "aauth-agent.json"
             metadata_path, audience = AAUTH_METADATA_PATH, None
@@ -324,15 +327,32 @@ class HttpsigVerifier:
                 return None
             scheme, expected_dwk = "aauth-person", "aauth-person.json"
             metadata_path, audience = AAUTH_PERSON_METADATA_PATH, self.config.resource_url
+        elif typ == AAUTH_AUTH_TYP:
+            if not self.config.resource_url or not self.config.trusted_ps:
+                logger.info("auth token presented but resource_url/trusted_ps is not "
+                            "configured — auth-token verification is disabled")
+                return None
+            scheme, expected_dwk = "aauth-auth", None
+            metadata_path, audience = None, self.config.resource_url
         else:
             return None
 
         iss = str(unverified.get("iss", ""))
-        bad_iss = unverified.get("dwk") != expected_dwk or not iss.startswith("https://")
-        if bad_iss and not (
-            iss and urlsplit(iss).hostname in self.config.insecure_hosts  # dev escape
-        ):
-            return None
+        if typ == AAUTH_AUTH_TYP:
+            # The resource pins its PS: issuer must be explicitly trusted and its
+            # JWKS location comes from configuration, not open-world discovery.
+            override = self.config.trusted_ps.get(iss)
+            if override is None:
+                logger.info("auth token issuer %s is not a configured PS", iss[:100])
+                return None
+            jwks_override = override
+        else:
+            bad_iss = (unverified.get("dwk") != expected_dwk
+                       or not iss.startswith("https://"))
+            if bad_iss and not (
+                iss and urlsplit(iss).hostname in self.config.insecure_hosts  # dev escape
+            ):
+                return None
 
         # AAuth -11 / RFC 9864: fully-specified algorithms. "EdDSA" (polymorphic)
         # is accepted only while require_fully_specified_algs is False — a
@@ -342,10 +362,13 @@ class HttpsigVerifier:
             allowed_algs.append("EdDSA")
 
         # 1) Verify the token against the issuer's published JWKS.
-        metadata = await self._fetch_json(iss.rstrip("/") + metadata_path)
-        if not metadata or not metadata.get("jwks_uri"):
-            return None
-        jwks = await self._fetch_json(str(metadata["jwks_uri"]))
+        if jwks_override is not None:
+            jwks = await self._fetch_json(jwks_override)
+        else:
+            metadata = await self._fetch_json(iss.rstrip("/") + str(metadata_path))
+            if not metadata or not metadata.get("jwks_uri"):
+                return None
+            jwks = await self._fetch_json(str(metadata["jwks_uri"]))
         if not jwks:
             return None
         issuer_key = None
@@ -379,11 +402,11 @@ class HttpsigVerifier:
             logger.info("aauth token invalid iss=%s: %s", iss, str(exc)[:200])
             return None
 
-        # -11: a person token "lives at most one hour".
-        if typ == AAUTH_PERSON_TYP:
+        # -11: person and auth tokens live at most one hour.
+        if typ in (AAUTH_PERSON_TYP, AAUTH_AUTH_TYP):
             lifetime = int(claims.get("exp", 0)) - int(claims.get("iat", 0))
             if lifetime <= 0 or lifetime > PERSON_TOKEN_MAX_LIFETIME:
-                logger.info("person token lifetime %ss out of bounds iss=%s", lifetime, iss)
+                logger.info("%s lifetime %ss out of bounds iss=%s", typ, lifetime, iss)
                 return None
 
         # 2) Proof of possession: the request signature must verify against cnf.jwk.
@@ -423,12 +446,14 @@ class HttpsigVerifier:
             scheme=scheme,
             agent=iss,
             keyid=jwk_thumbprint(cnf_jwk),
-            trusted=iss in self.config.trusted_agents,
+            # An auth-token issuer is by definition a configured, trusted PS.
+            trusted=iss in self.config.trusted_agents or typ == AAUTH_AUTH_TYP,
             sub=str(claims.get("sub", "")),
             label=label,
             claims={
                 k: claims[k]
-                for k in ("iss", "sub", "exp", "ps", "aud", "jti", "mission_s256")
+                for k in ("iss", "sub", "exp", "ps", "aud", "jti", "mission_s256",
+                          "budget")  # budgets: the envelope rides in the token
                 if k in claims
             },
         )

@@ -32,6 +32,8 @@ __all__ = [
     "SFDictionary",
     "SFItem",
     "StaticKeyResolver",
+    "build_aauth_budget_header",
+    "build_aauth_requirement",
     "parse_signature_agent",
     "parse_signature_key_header",
 ]
@@ -130,3 +132,51 @@ def parse_signature_key_header(value: str) -> tuple[str, str] | None:
     except Exception:  # noqa: BLE001
         return None
     return None
+
+
+# ── AAuth Budgets response headers (draft-hardt-aauth-budgets) ───────────────
+# Hand-serialized: the value space is tiny (non-negative sf-integers, one
+# sf-string, sf-tokens) and the golden tests round-trip the output through the
+# real http_sfv parser. NOTE: the field is declared an RFC 9651 *Dictionary*,
+# so members are comma-separated — the draft's §11 example shows semicolons,
+# which is the *parameter* separator; flagged for the implementation report.
+
+
+def _sf_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def build_aauth_budget_header(
+    *,
+    remaining: int,
+    cost: int | None = None,
+    reserved: int | None = None,
+    unit: str | None = None,
+    decimals: int | None = None,
+) -> str:
+    """Serialize the ``AAuth-Budget`` response header. ``remaining`` is the only
+    REQUIRED member; ``unit``/``decimals`` must travel together or not at all."""
+    if (unit is None) != (decimals is None):
+        raise ValueError("unit and decimals must be provided together")
+    members: list[str] = []
+    if cost is not None:
+        members.append(f"cost={cost}")
+    members.append(f"remaining={remaining}")
+    if reserved is not None:
+        members.append(f"reserved={reserved}")
+    if unit is not None and decimals is not None:
+        members.append(f"unit={_sf_string(unit)}")
+        members.append(f"decimals={decimals}")
+    return ", ".join(members)
+
+
+def build_aauth_requirement(*, reason: str, resource_token: str | None = None) -> str:
+    """Serialize ``AAuth-Requirement`` for a budget refusal:
+    ``requirement=auth-token;resource-token="eyJ…";reason=insufficient-budget``.
+    ``reason`` is an sf-token (``insufficient-budget`` | ``budget-exhausted``);
+    the resource token (when the resource issues one) rides as an sf-string."""
+    out = "requirement=auth-token"
+    if resource_token:
+        out += f";resource-token={_sf_string(resource_token)}"
+    out += f";reason={reason}"
+    return out

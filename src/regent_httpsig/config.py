@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 __all__ = ["HttpsigConfig"]
@@ -38,3 +39,9 @@ class HttpsigConfig:
     # AAuth person tokens — their `aud` must name this resource. None disables
     # the person-token path entirely.
     resource_url: str | None = None
+    # AAuth auth tokens (typ "aa-auth+jwt" — the carrier of budget envelopes):
+    # issuer → JWKS URL for each Person Server this resource accepts auth tokens
+    # from. A resource has an established relationship with its PS, so the key
+    # location is pinned by configuration rather than discovered open-world.
+    # Empty (the default) disables the auth-token path entirely.
+    trusted_ps: Mapping[str, str] = field(default_factory=dict)
