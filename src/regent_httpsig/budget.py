@@ -104,6 +104,7 @@ class _Pool:
     decimals: int
     grants: dict[str, tuple[int, float]] = field(default_factory=dict)  # jti -> (amount, exp)
     consumed: dict[str, int] = field(default_factory=dict)  # jti -> total committed
+    jkt_of: dict[str, str] = field(default_factory=dict)  # jti -> presenting key thumbprint
     reservations: dict[int, tuple[str, int, float]] = field(default_factory=dict)
     last_activity: float = 0.0
 
@@ -157,10 +158,13 @@ class InMemoryMeter:
     # ── public interface (the BudgetMeter contract) ──────────────────────────
 
     async def observe_grant(self, key: MeterKey, jti: str, claim: BudgetClaim,
-                            exp: float) -> None:
+                            exp: float, jkt: str = "") -> None:
         """Register a token's envelope in the principal's pool (idempotent per
-        ``jti``). Raises :class:`UnitMismatch` if the pool already runs in a
-        different unit — one envelope, one unit, no FX at the meter."""
+        ``jti``). ``jkt`` is the RFC 7638 thumbprint of the token's ``cnf`` key —
+        recorded so consumption records can be scoped to the presenting agent
+        (one agent must not learn about its siblings). Raises
+        :class:`UnitMismatch` if the pool already runs in a different unit —
+        one envelope, one unit, no FX at the meter."""
         async with self._lock:
             now = time.monotonic()
             wall_delta = exp - time.time()
@@ -173,6 +177,8 @@ class InMemoryMeter:
                     f"pool runs in {pool.unit}/{pool.decimals}, "
                     f"grant is {claim.unit}/{claim.decimals}")
             pool.last_activity = now
+            if jkt:
+                pool.jkt_of.setdefault(jti, jkt)
             if jti not in pool.grants and wall_delta > 0:
                 pool.grants[jti] = (claim.amount, now + wall_delta)
 
@@ -219,10 +225,18 @@ class InMemoryMeter:
             pool = self._purge(key, time.monotonic())
             return 0 if pool is None else self._remaining(pool)
 
-    async def consumed_records(self, key: MeterKey) -> list[dict[str, Any]]:
+    async def consumed_records(self, key: MeterKey,
+                               jkt: str | None = None) -> list[dict[str, Any]]:
         """Per-token consumption for the resource token's ``budget_consumed``
         claim: ``[{"jti": ..., "consumed": ...}, ...]``. Non-destructive — the
-        PS deduplicates by ``jti``, so reporting the same record twice is safe."""
+        PS deduplicates by ``jti``, so reporting the same record twice is safe.
+
+        When ``jkt`` is given, records are scoped to tokens bound to that key:
+        the agent carrying the resource token sees only its OWN spending, never
+        its siblings' (privacy between a principal's agents, and no extra
+        figures to infer the ceiling from). Consequence: an abandoned agent's
+        records are never carried home by siblings — the PS-side conservative
+        rule (unreported expired allocation = fully consumed) is the backstop."""
         async with self._lock:
             pool = self._purge(key, time.monotonic())
             if pool is None:
@@ -230,5 +244,5 @@ class InMemoryMeter:
             return [
                 {"jti": jti, "consumed": total}
                 for jti, total in sorted(pool.consumed.items())
-                if total > 0
+                if total > 0 and (jkt is None or pool.jkt_of.get(jti) == jkt)
             ]

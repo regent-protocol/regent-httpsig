@@ -175,6 +175,58 @@ async def test_meter_commit_clamps_to_reservation() -> None:
     assert await meter.commit(res, 999999) == 700  # clamped to the 300 hold
 
 
+async def test_consumed_records_scoped_to_presenting_jkt() -> None:
+    """Two agents of one principal share the (iss, sub, aud) pool, but each
+    sees only ITS OWN consumption records — never its siblings' (privacy +
+    no extra figures to infer the ceiling from)."""
+    meter = InMemoryMeter()
+    now = time.time()
+    await meter.observe_grant(KEY, "jti-a", _claim(500), now + 60, jkt="jkt-agent-A")
+    await meter.observe_grant(KEY, "jti-b", _claim(500), now + 60, jkt="jkt-agent-B")
+    for jti, cost in (("jti-a", 100), ("jti-b", 250)):
+        res = await meter.reserve(KEY, jti, cost)
+        assert isinstance(res, Reservation)
+        await meter.commit(res, cost)
+
+    assert await meter.consumed_records(KEY, jkt="jkt-agent-A") == [
+        {"jti": "jti-a", "consumed": 100}
+    ]
+    assert await meter.consumed_records(KEY, jkt="jkt-agent-B") == [
+        {"jti": "jti-b", "consumed": 250}
+    ]
+    # Unscoped (PS-side / audit view) still returns the whole pool.
+    assert len(await meter.consumed_records(KEY)) == 2
+
+
+async def test_refusal_records_scoped_to_presenter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resource token embedded in a refusal carries only the presenting
+    agent's records: sibling B's spend must not ride home with agent A."""
+    ps_priv, ps_jwk = _ps_pair()
+    agent_a = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
+    agent_b = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
+    token_a = _auth_token(ps_priv, agent_a, amount=400, jti="at-A")
+    token_b = _auth_token(ps_priv, agent_b, amount=400, jti="at-B")
+    provider_records: list[Any] = []
+
+    def provider(key: Any, records: Any) -> str:
+        provider_records.append(records)
+        return "resource.token"
+
+    app = _app(_verifier(ps_jwk, monkeypatch), resource_token_provider=provider)
+
+    # A spends 300 (price of /v1/search), B spends 300 — pool now at 200.
+    assert (await _post(app, "/v1/search",
+                        _signed_headers(agent_a, token_a, "/v1/search"))).status_code == 200
+    assert (await _post(app, "/v1/search",
+                        _signed_headers(agent_b, token_b, "/v1/search"))).status_code == 200
+    # B asks again: 300 > 200 remaining → refusal with records — B's only.
+    r = await _post(app, "/v1/search", _signed_headers(agent_b, token_b, "/v1/search"))
+    assert r.status_code == 401
+    assert provider_records == [[{"jti": "at-B", "consumed": 300}]]
+
+
 async def test_meter_concurrent_reserves_never_oversell() -> None:
     meter = InMemoryMeter()
     await meter.observe_grant(KEY, "jti-1", _claim(1000), time.time() + 60)

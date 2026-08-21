@@ -207,8 +207,12 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             str(sig.claims.get("aud", "")),
         )
         try:
+            # sig.keyid is the RFC 7638 thumbprint of the token's cnf key (jkt) —
+            # recorded so refusal-time consumption records are scoped to the
+            # presenting agent and never disclose its siblings' spending.
             await self._meter.observe_grant(key, jti, envelope,
-                                            float(sig.claims.get("exp", 0)))
+                                            float(sig.claims.get("exp", 0)),
+                                            jkt=sig.keyid)
         except UnitMismatch as exc:
             logger.warning("budget unit mismatch for %s: %s", key, exc)
             return self._refusal(reason="insufficient-budget", envelope=envelope,
@@ -218,7 +222,8 @@ class BudgetMiddleware(BaseHTTPMiddleware):
         if isinstance(outcome, InsufficientBudget):
             reason = "budget-exhausted" if outcome.exhausted else "insufficient-budget"
             return await self._refusal_with_token(
-                reason=reason, envelope=envelope, remaining=outcome.remaining, key=key
+                reason=reason, envelope=envelope, remaining=outcome.remaining,
+                key=key, jkt=sig.keyid,
             )
 
         reservation: Reservation = outcome
@@ -258,12 +263,12 @@ class BudgetMiddleware(BaseHTTPMiddleware):
 
     async def _refusal_with_token(
         self, *, reason: str, envelope: BudgetClaim,
-        remaining: int, key: MeterKey,
+        remaining: int, key: MeterKey, jkt: str | None = None,
     ) -> Response:
         token: str | None = None
         if self._resource_token is not None:
             try:
-                records = await self._meter.consumed_records(key)
+                records = await self._meter.consumed_records(key, jkt=jkt)
                 token = await _maybe_await(self._resource_token(key, records))
             except Exception:  # noqa: BLE001 — refusal must not fail on the extras
                 logger.warning("resource_token_provider failed", exc_info=True)
