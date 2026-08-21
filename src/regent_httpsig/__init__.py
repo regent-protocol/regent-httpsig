@@ -22,7 +22,7 @@ from regent_httpsig.sfv import (
 from regent_httpsig.sign import DIRECTORY_MEDIA_TYPE, EgressSigner, generate_seed
 from regent_httpsig.verify import WBA_TAG, HttpsigVerifier, VerifiedSignature
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "DIRECTORY_MEDIA_TYPE",

@@ -108,6 +108,36 @@ keyid-less shape is pinned in CI.
   [christian-posta/aauth-python-library](https://github.com/christian-posta/aauth-python-library) —
   this library is the thin relying-party verifier that handles both dialects.
 
+## Budgets: meter a spending envelope (draft-hardt-aauth-budgets)
+
+An agent can carry a PS-issued **auth token** (`typ: aa-auth+jwt`) with a
+`budget` claim — a spending envelope it uses offline, no per-call round trip
+to the control plane. The middleware does the whole resource-side checklist:
+verify the token against your pinned PS, atomically reserve → commit →
+release per request, answer with `AAuth-Budget`, and refuse exhausted
+envelopes with a `401` + `AAuth-Requirement` (optionally carrying your signed
+resource token with the agent's own consumption records — scoped to its key,
+so one agent never learns about a sibling's spending):
+
+```python
+from regent_httpsig import HttpsigConfig, HttpsigVerifier, InMemoryMeter
+from regent_httpsig.fastapi import BudgetMiddleware
+
+app.add_middleware(
+    BudgetMiddleware,
+    verifier=HttpsigVerifier(HttpsigConfig(
+        resource_url="https://api.example",
+        trusted_ps={"my-ps": "https://ps.example/jwks.json"},
+    )),
+    meter=InMemoryMeter(),
+    price_fn=lambda request: PRICES.get(request.url.path),  # max cost, minor units
+)
+```
+
+The only thing the library cannot do for you is pricing (`price_fn`) — that
+is your domain. First known implementation of the draft; running in
+production on [get4agent.com](https://get4agent.com).
+
 ## Security model (what a naive implementation gets wrong)
 
 The verifier fetches key directories from **attacker-nameable origins** — whoever signs a

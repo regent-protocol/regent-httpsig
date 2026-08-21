@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0
+
+**AAuth Budgets** (draft-hardt-aauth-budgets, editor's copy) — the resource
+side, first known implementation (running in production on get4agent.com):
+
+- **Auth tokens** (`typ: aa-auth+jwt`): PS-issued budget carriers verified
+  against a configuration-pinned PS (`HttpsigConfig.trusted_ps`: issuer →
+  JWKS URL), `aud`-checked against `resource_url`, `cnf`-bound, ≤1h lifetime.
+- **`BudgetClaim` + `InMemoryMeter`**: atomic reserve → commit → release
+  pooled per the draft's `(iss, sub, aud)` aggregation key; conservative
+  crash-safety (an unresolved reservation counts as consumed); consumption
+  records **scoped to the presenting agent's `jkt`** so one agent never
+  learns about a sibling's spending.
+- **`BudgetMiddleware`** (FastAPI): `price_fn` hook, metering cycle,
+  refusals (401 + `AAuth-Requirement` with `reason=insufficient-budget` /
+  `budget-exhausted` and an optional resource token via
+  `resource_token_provider`), per-response `AAuth-Budget` header; error
+  responses release the reservation.
+- `build_aauth_budget_header` / `build_aauth_requirement` — RFC 9651
+  serialization (note: the field is a Dictionary, so members are
+  comma-separated; the draft's §11 example shows parameter separators).
+
 ## 0.2.0
 
 AAuth draft **-11** support (per the editor's copy, ahead of datatracker publication):
