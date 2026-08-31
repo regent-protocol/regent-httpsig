@@ -169,6 +169,11 @@ async def usage(request: Request):
   metadata MUSTs before you mint a resource token — the "thousandfold error"
   guard.
 
+**Test vectors**: [`vectors/aauth-budgets-vectors.json`](vectors/aauth-budgets-vectors.json) —
+header serializations (including `required` and the cost-omitted streaming
+case), the budget object, consumption records, and a fully worked signed
+usage response with a fixed key, ready for cross-implementation checks.
+
 ## Security model (what a naive implementation gets wrong)
 
 The verifier fetches key directories from **attacker-nameable origins** — whoever signs a

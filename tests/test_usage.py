@@ -216,3 +216,16 @@ def test_validate_budget_grant_enforces_declared_units() -> None:
         validate_budget_grant("USD", 2, units)  # the thousandfold error
     with pytest.raises(ValueError):
         validate_budget_grant("EUR", 2, units)  # undeclared unit
+
+
+def test_vectors_are_current() -> None:
+    """The published vectors must match what the code emits today."""
+    import pathlib
+    import subprocess
+    import sys
+    root = pathlib.Path(__file__).resolve().parent.parent
+    before = (root / "vectors" / "aauth-budgets-vectors.json").read_text()
+    subprocess.run([sys.executable, str(root / "vectors" / "generate.py")],
+                   check=True, capture_output=True)
+    after = (root / "vectors" / "aauth-budgets-vectors.json").read_text()
+    assert before == after

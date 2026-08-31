@@ -1,0 +1,124 @@
+{
+  "source": "regent-httpsig, first implementation of draft-hardt-aauth-budgets (editor's copy, 2026-08-20)",
+  "headers": {
+    "aauth_budget": [
+      {
+        "name": "success-with-cost",
+        "input": {
+          "remaining": 1568800,
+          "cost": 221200,
+          "unit": "USD",
+          "decimals": 6
+        },
+        "expected": "cost=221200, remaining=1568800, unit=\"USD\", decimals=6"
+      },
+      {
+        "name": "refusal-insufficient-with-required",
+        "note": "`required` rides only on insufficient-budget refusals: what THIS request needed, so the retry is a calculation.",
+        "input": {
+          "remaining": 300,
+          "required": 750,
+          "unit": "USD",
+          "decimals": 6
+        },
+        "expected": "remaining=300, required=750, unit=\"USD\", decimals=6"
+      },
+      {
+        "name": "streaming-cost-omitted",
+        "note": "No-trailer runtime: cost omitted, reserved REQUIRED, remaining already net of the hold. The agent recovers cost = prev remaining + reserved - next remaining.",
+        "input": {
+          "remaining": 1568800,
+          "reserved": 431200,
+          "unit": "USD",
+          "decimals": 6
+        },
+        "expected": "remaining=1568800, reserved=431200, unit=\"USD\", decimals=6"
+      },
+      {
+        "name": "exhaustion-zero",
+        "input": {
+          "remaining": 0,
+          "unit": "USD",
+          "decimals": 6
+        },
+        "expected": "remaining=0, unit=\"USD\", decimals=6"
+      }
+    ],
+    "aauth_requirement": [
+      {
+        "name": "refusal-with-resource-token",
+        "input": {
+          "reason": "budget-exhausted",
+          "resource_token": "eyJexample"
+        },
+        "expected": "requirement=auth-token;resource-token=\"eyJexample\";reason=budget-exhausted"
+      }
+    ]
+  },
+  "budget_claim": {
+    "shape": {
+      "amount": 5000000,
+      "unit": "USD",
+      "decimals": 6
+    },
+    "notes": [
+      "amount: non-negative integer, bounded by the 15-digit SF limit",
+      "decimals is NOT constrained to the ISO 4217 minor unit",
+      "all three members REQUIRED wherever `budget` appears"
+    ]
+  },
+  "consumption_records": {
+    "budget_consumed": [
+      {
+        "jti": "at-2",
+        "consumed": 431200
+      },
+      {
+        "jti": "at-1",
+        "consumed": 221200
+      }
+    ],
+    "notes": [
+      "two members and no more \u2014 the PS joins the rest from its ledger",
+      "records are scoped to the presenting agent's key (jkt): one agent never learns a sibling's spending",
+      "most recent first; SHOULD NOT exceed 20 records"
+    ]
+  },
+  "signed_usage_response": {
+    "signing_key": {
+      "seed_b64url": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "public_jwk": {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
+      },
+      "keyid_rfc7638": "1IG2tMH7J2wbJZnOf8LJzQitKf7LMvoAElsuDMVM54Y"
+    },
+    "request_context": {
+      "authority": "api.example",
+      "path": "/usage"
+    },
+    "body": {
+      "as_of": 1756500000,
+      "aud": "https://ps.example",
+      "unit": "USD",
+      "decimals": 6,
+      "sub": "8f14e45fceea167a5a36dedd4bea2543",
+      "usage": {
+        "day": 1243180,
+        "all_time": 61438050
+      },
+      "jkts": {
+        "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs": 38215600
+      }
+    },
+    "body_canonical_json": "{\"as_of\":1756500000,\"aud\":\"https://ps.example\",\"unit\":\"USD\",\"decimals\":6,\"sub\":\"8f14e45fceea167a5a36dedd4bea2543\",\"usage\":{\"day\":1243180,\"all_time\":61438050},\"jkts\":{\"NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs\":38215600}}",
+    "signature_base": "\"@status\": 200\n\"content-type\": application/json\n\"content-digest\": sha-256=:Jj+8+vDgDSFJryQMnASY9O2TEznYDi1lsJ/+DRo7s14=:\n\"@authority\";req: api.example\n\"@path\";req: /usage\n\"@signature-params\": (\"@status\" \"content-type\" \"content-digest\" \"@authority\";req \"@path\";req);created=1756500001",
+    "response_headers": {
+      "Content-Digest": "sha-256=:Jj+8+vDgDSFJryQMnASY9O2TEznYDi1lsJ/+DRo7s14=:",
+      "Signature-Input": "sig=(\"@status\" \"content-type\" \"content-digest\" \"@authority\";req \"@path\";req);created=1756500001",
+      "Signature": "sig=:tPyxKUn/9Grz7cMH0k6RIKjoy78KuoqkrMUZsocLi1UtWxFgqyKo0yANnu4TBlZm6593A9BzgoaUrv7mgFtUCA==:",
+      "Signature-Key": "sig=jwks_uri; jwks_uri=\"https://api.example/jwks.json\""
+    }
+  }
+}
