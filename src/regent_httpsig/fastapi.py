@@ -224,6 +224,9 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             return await self._refusal_with_token(
                 reason=reason, envelope=envelope, remaining=outcome.remaining,
                 key=key, jkt=sig.keyid,
+                # `required` rides only on insufficient-budget: what THIS
+                # request needed, so the agent can lower its bound and retry.
+                required=int(max_cost) if reason == "insufficient-budget" else None,
             )
 
         reservation: Reservation = outcome
@@ -237,6 +240,21 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             # Nothing was served — the envelope is not charged for errors.
             remaining = await self._meter.release(reservation)
             cost = 0
+        elif self._is_streamed(request, response):
+            # Cost-omitted mode (draft §cost-omitted): a streamed response's
+            # actual cost is known only when the stream ends, and this runtime
+            # sends no trailers. We state what we HOLD — `reserved`, REQUIRED
+            # when `cost` is omitted — with `remaining` already net of the
+            # hold, and commit when the stream completes. The agent recovers
+            # the exact figure from the next response's `remaining`.
+            remaining = await self._meter.remaining(key)
+            response.headers["AAuth-Budget"] = build_aauth_budget_header(
+                remaining=remaining, reserved=int(max_cost),
+                unit=envelope.unit, decimals=envelope.decimals,
+            )
+            self._commit_after_stream(request, response, reservation,
+                                      int(max_cost))
+            return response
         else:
             actual = getattr(request.state, "budget_cost", None)
             cost = int(actual) if actual is not None else int(max_cost)
@@ -246,6 +264,36 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             unit=envelope.unit, decimals=envelope.decimals,
         )
         return response
+
+    @staticmethod
+    def _is_streamed(request: Request, response: Response) -> bool:
+        """A handler opts in with ``request.state.budget_streaming = True``;
+        SSE responses are recognized on their own."""
+        if getattr(request.state, "budget_streaming", False):
+            return True
+        ctype = response.headers.get("content-type", "")
+        return ctype.startswith("text/event-stream")
+
+    def _commit_after_stream(self, request: Request, response: Response,
+                             reservation: Reservation, max_cost: int) -> None:
+        """Wrap the body iterator: commit when the stream ends (the handler may
+        set ``request.state.budget_cost`` while streaming), release the unspent
+        remainder; a broken stream commits the full hold — conservative, per
+        the reservation-timeout rule."""
+        inner = response.body_iterator  # type: ignore[attr-defined]
+
+        async def metered() -> Any:
+            ok = False
+            try:
+                async for chunk in inner:
+                    yield chunk
+                ok = True
+            finally:
+                actual = getattr(request.state, "budget_cost", None)
+                cost = int(actual) if (ok and actual is not None) else max_cost
+                await self._meter.commit(reservation, cost)
+
+        response.body_iterator = metered()  # type: ignore[attr-defined]
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -264,6 +312,7 @@ class BudgetMiddleware(BaseHTTPMiddleware):
     async def _refusal_with_token(
         self, *, reason: str, envelope: BudgetClaim,
         remaining: int, key: MeterKey, jkt: str | None = None,
+        required: int | None = None,
     ) -> Response:
         token: str | None = None
         if self._resource_token is not None:
@@ -273,12 +322,13 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             except Exception:  # noqa: BLE001 — refusal must not fail on the extras
                 logger.warning("resource_token_provider failed", exc_info=True)
         return self._refusal(reason=reason, envelope=envelope,
-                             remaining=remaining, resource_token=token)
+                             remaining=remaining, resource_token=token,
+                             required=required)
 
     def _refusal(
         self, *, reason: str | None, envelope: BudgetClaim | None,
         remaining: int | None, key: MeterKey | None = None,
-        resource_token: str | None = None,
+        resource_token: str | None = None, required: int | None = None,
     ) -> Response:
         headers = {
             "AAuth-Requirement": build_aauth_requirement(
@@ -288,7 +338,8 @@ class BudgetMiddleware(BaseHTTPMiddleware):
         }
         if remaining is not None and envelope is not None:
             headers["AAuth-Budget"] = build_aauth_budget_header(
-                remaining=remaining, unit=envelope.unit, decimals=envelope.decimals
+                remaining=remaining, required=required,
+                unit=envelope.unit, decimals=envelope.decimals,
             )
         code = "AUTH_TOKEN_REQUIRED" if reason is None else reason.upper().replace("-", "_")
         return JSONResponse(

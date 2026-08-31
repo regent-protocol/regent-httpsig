@@ -276,7 +276,8 @@ def _app(verifier: HttpsigVerifier, **mw_kwargs: Any) -> FastAPI:
     app.add_middleware(
         BudgetMiddleware,
         verifier=verifier,
-        price_fn=lambda request: 300 if request.url.path == "/v1/search" else None,
+        price_fn=lambda request: (
+            300 if request.url.path in ("/v1/search", "/v1/stream") else None),
         **mw_kwargs,
     )
 
@@ -292,6 +293,17 @@ def _app(verifier: HttpsigVerifier, **mw_kwargs: Any) -> FastAPI:
     @app.post("/free")
     async def free() -> dict[str, bool]:
         return {"ok": True}
+
+    @app.post("/v1/stream")
+    async def stream(request: Request):  # type: ignore[no-untyped-def]
+        from starlette.responses import StreamingResponse
+
+        async def gen():  # type: ignore[no-untyped-def]
+            yield b"data: one\n\n"
+            request.state.budget_cost = 120  # actual, learned mid-stream
+            yield b"data: two\n\n"
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
 
     return app
 
@@ -365,7 +377,8 @@ async def test_middleware_refuses_when_insufficient(
     assert (r2.headers["AAuth-Requirement"] ==
             'requirement=auth-token;resource-token="resource.token.here"'
             ";reason=insufficient-budget")
-    assert r2.headers["AAuth-Budget"] == 'remaining=200, unit="KZT", decimals=2'
+    assert (r2.headers["AAuth-Budget"] ==
+            'remaining=200, required=300, unit="KZT", decimals=2')
     assert provider_calls and provider_calls[0][0] == (PS_ISS, "owner-1", RESOURCE)
     assert provider_calls[0][1] == [{"jti": "at-1", "consumed": 300}]
 
@@ -447,3 +460,30 @@ async def test_middleware_releases_on_error_response(
     assert r.status_code == 422
     # Nothing served → envelope not charged.
     assert r.headers["AAuth-Budget"] == 'cost=0, remaining=1000, unit="KZT", decimals=2'
+
+
+async def test_streaming_cost_omitted_reserved_math(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§cost-omitted: no trailer runtime — the header states `reserved` (and no
+    `cost`), `remaining` is net of the hold, and the agent recovers the exact
+    figure from the NEXT response: prev remaining + reserved − next remaining."""
+    ps_priv, ps_jwk = _ps_pair()
+    agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
+    token = _auth_token(ps_priv, agent, amount=1000)
+    app = _app(_verifier(ps_jwk, monkeypatch))
+
+    r1 = await _post(app, "/v1/stream", _signed_headers(agent, token, "/v1/stream"))
+    assert r1.status_code == 200
+    d1 = SFDictionary(); d1.parse(r1.headers["AAuth-Budget"].encode())
+    assert "cost" not in d1                      # omitted — no trailer runtime
+    assert int(str(d1["reserved"].value)) == 300  # REQUIRED when cost omitted
+    assert int(str(d1["remaining"].value)) == 700  # net of the hold
+    assert r1.text.count("data:") == 2
+
+    # Stream ended → the actual 120 was committed, 180 returned to the grant.
+    r2 = await _post(app, "/v1/search", _signed_headers(agent, token, "/v1/search"))
+    d2 = SFDictionary(); d2.parse(r2.headers["AAuth-Budget"].encode())
+    next_remaining = int(str(d2["remaining"].value)) + 300  # add back r2's own cost
+    recovered = 1000 + 300 - 700 - (1000 - next_remaining)  # draft's subtraction…
+    assert 700 + 300 - next_remaining == 120     # …prev + reserved − next = cost

@@ -21,6 +21,7 @@ import asyncio
 import itertools
 import time
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -109,6 +110,48 @@ class _Pool:
     last_activity: float = 0.0
 
 
+@dataclass
+class _ScopeCounters:
+    """Calendar counters for one usage scope (draft §calendar-counters): running
+    integers bucketed on UTC boundaries — no per-record history is kept."""
+
+    all_time: int = 0
+    day: int = 0
+    week: int = 0
+    month: int = 0
+    year: int = 0
+    day_start: float = 0.0
+    week_start: float = 0.0
+    month_start: float = 0.0
+    year_start: float = 0.0
+
+    def add(self, amount: int, wall: float) -> None:
+        self._roll(wall)
+        self.all_time += amount
+        self.day += amount
+        self.week += amount
+        self.month += amount
+        self.year += amount
+
+    def snapshot(self, wall: float) -> dict[str, int]:
+        self._roll(wall)
+        return {"day": self.day, "week": self.week, "month": self.month,
+                "year": self.year, "all_time": self.all_time}
+
+    def _roll(self, wall: float) -> None:
+        dt = datetime.fromtimestamp(wall, tz=UTC)
+        day = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        week = day - timedelta(days=dt.weekday())  # Monday 00:00 UTC (ISO 8601)
+        month = day.replace(day=1)
+        year = month.replace(month=1)
+        for name, start in (("day", day), ("week", week),
+                            ("month", month), ("year", year)):
+            ts = start.timestamp()
+            if getattr(self, f"{name}_start") < ts:
+                setattr(self, name, 0)
+                setattr(self, f"{name}_start", ts)
+
+
 class InMemoryMeter:
     """Single-process meter (asyncio-safe). Right for a single-instance service;
     multi-replica deployments need a shared backend behind the same interface.
@@ -119,12 +162,23 @@ class InMemoryMeter:
     """
 
     def __init__(self, *, reservation_ttl: float = 120.0,
-                 retention_seconds: float = 7200.0) -> None:
+                 retention_seconds: float = 7200.0,
+                 usage_key_retention: float = 86400.0) -> None:
         self._pools: dict[MeterKey, _Pool] = {}
         self._lock = asyncio.Lock()
         self._rids = itertools.count(1)
         self._reservation_ttl = reservation_ttl
         self._retention = retention_seconds
+        # Usage counters (draft §usage-counters) — wall-clock, keyed by the
+        # issuing PS so the endpoint only answers the party whose tokens we
+        # accepted. Scope counters never expire (all_time reaches as far back
+        # as the resource retains); per-key figures are pruned on IDLE time —
+        # "SHOULD retain … at least 24 hours after that key's last metered
+        # request" — so a key in continuous use is never pruned.
+        self._usage_key_retention = usage_key_retention
+        self._scope_usage: dict[tuple[str, str], _ScopeCounters] = {}  # (iss, sub)
+        self._key_usage: dict[tuple[str, str], tuple[int, float]] = {}  # (iss, jkt) -> (total, last_wall)
+        self._metering_unit: tuple[str, int] | None = None
 
     # ── internals (call under lock) ──────────────────────────────────────────
 
@@ -137,6 +191,7 @@ class InMemoryMeter:
             if deadline <= now:
                 pool.consumed[jti] = pool.consumed.get(jti, 0) + amount
                 del pool.reservations[rid]
+                self._record_usage(key, pool, jti, amount)
         # Expired grants leave the pool; their consumption records remain for
         # budget_consumed reporting until the retention window passes.
         for jti, (_, exp) in list(pool.grants.items()):
@@ -210,6 +265,8 @@ class InMemoryMeter:
             cost = min(max(actual, 0), held[1] if held else res.amount)
             pool.consumed[res.jti] = pool.consumed.get(res.jti, 0) + cost
             pool.last_activity = now
+            if cost > 0:
+                self._record_usage(res.key, pool, res.jti, cost)
             return self._remaining(pool)
 
     async def release(self, res: Reservation) -> int:
@@ -224,6 +281,46 @@ class InMemoryMeter:
         async with self._lock:
             pool = self._purge(key, time.monotonic())
             return 0 if pool is None else self._remaining(pool)
+
+    def _record_usage(self, key: MeterKey, pool: _Pool, jti: str,
+                      amount: int) -> None:
+        """Post a committed cost to the usage counters (call under lock).
+        Wall-clock, because calendar boundaries are UTC by definition."""
+        if amount <= 0:
+            return
+        wall = time.time()
+        iss, sub, _aud = key
+        self._metering_unit = self._metering_unit or (pool.unit, pool.decimals)
+        self._scope_usage.setdefault((iss, sub), _ScopeCounters()).add(amount, wall)
+        jkt = pool.jkt_of.get(jti)
+        if jkt:
+            total, _ = self._key_usage.get((iss, jkt), (0, 0.0))
+            self._key_usage[(iss, jkt)] = (total + amount, wall)
+
+    async def usage_scope(self, iss: str, sub: str) -> dict[str, int] | None:
+        """Calendar counters for a ``sub`` scope query, or ``None`` when the
+        resource holds no figure — the endpoint then omits ``usage``, keeping
+        "never seen" indistinguishable from "nothing consumed"."""
+        async with self._lock:
+            counters = self._scope_usage.get((iss, sub))
+            return None if counters is None else counters.snapshot(time.time())
+
+    async def usage_keys(self, iss: str, jkts: list[str]) -> dict[str, int]:
+        """Per-key totals for a ``jkts`` query. Unrecognized or pruned keys are
+        OMITTED, never reported as zero — absence means "cannot answer", a
+        present zero would be a wrong answer to an allocation decision."""
+        async with self._lock:
+            wall = time.time()
+            for pair, (_, last) in list(self._key_usage.items()):
+                if wall - last > self._usage_key_retention:
+                    del self._key_usage[pair]
+            return {jkt: self._key_usage[(iss, jkt)][0]
+                    for jkt in jkts if (iss, jkt) in self._key_usage}
+
+    def metering_unit(self) -> tuple[str, int] | None:
+        """The one unit every usage figure is denominated in (draft §one-unit),
+        or ``None`` before the first commit."""
+        return self._metering_unit
 
     async def consumed_records(self, key: MeterKey,
                                jkt: str | None = None) -> list[dict[str, Any]]:

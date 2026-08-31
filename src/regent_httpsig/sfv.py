@@ -151,11 +151,15 @@ def build_aauth_budget_header(
     remaining: int,
     cost: int | None = None,
     reserved: int | None = None,
+    required: int | None = None,
     unit: str | None = None,
     decimals: int | None = None,
 ) -> str:
     """Serialize the ``AAuth-Budget`` response header. ``remaining`` is the only
-    REQUIRED member; ``unit``/``decimals`` must travel together or not at all."""
+    REQUIRED member; ``unit``/``decimals`` must travel together or not at all.
+    ``required`` is the maximum cost of a request refused ``insufficient-budget``
+    — sent only with that refusal, so the agent's retry is a calculation
+    (lower the bound to fit ``remaining``) rather than a search."""
     if (unit is None) != (decimals is None):
         raise ValueError("unit and decimals must be provided together")
     members: list[str] = []
@@ -164,6 +168,8 @@ def build_aauth_budget_header(
     members.append(f"remaining={remaining}")
     if reserved is not None:
         members.append(f"reserved={reserved}")
+    if required is not None:
+        members.append(f"required={required}")
     if unit is not None and decimals is not None:
         members.append(f"unit={_sf_string(unit)}")
         members.append(f"decimals={decimals}")

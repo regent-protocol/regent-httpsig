@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.0
+
+**AAuth Budgets — the August 20 editor's-copy additions** (allocation model,
+omitted cost, `required`, usage counters):
+
+- **`required` member**: an `insufficient-budget` refusal now carries the
+  refused request's maximum cost in `AAuth-Budget`, so the agent's retry is a
+  calculation (fit the bound to `remaining`) rather than a search.
+- **Streaming / cost-omitted** (§cost-omitted): a streamed response states
+  `reserved` (REQUIRED when `cost` is omitted) with `remaining` already net of
+  the hold, commits when the stream ends (`request.state.budget_cost` may be
+  set mid-stream), and the agent recovers the exact figure from the next
+  response's `remaining`. SSE is recognized automatically; other streams opt
+  in with `request.state.budget_streaming = True`.
+- **Usage endpoint** (§Usage Counters): `make_usage_endpoint(meter, …)` —
+  scope queries (`sub` calendar counters: day/week/month/year/all_time on UTC
+  boundaries) and per-key `jkts` queries; unrecognized scope values omit
+  `usage` (never zero — a query must not reveal whether an account exists);
+  unrecognized/pruned thumbprints are omitted from `jkts` (never zero — a
+  false zero misleads an allocation decision); per-key figures pruned on 24h
+  IDLE, so a key in continuous use is never pruned; figures keyed by the
+  issuing PS, so the endpoint structurally answers only the party whose
+  tokens were accepted. PS authentication is pluggable (`authenticate_ps`).
+- **Signed usage responses** (§The Signed Response): `ResponseSigner` — an
+  Ed25519 HTTP Sig over `@status`, `content-type`, `content-digest`, bound to
+  the request via `@authority`/`@path` with the `req` parameter.
+- **`validate_budget_grant`**: the §Resource Metadata MUSTs (only declared
+  units; declared decimals) as a pre-mint guard against the draft's
+  "thousandfold error".
+
 ## 0.3.0
 
 **AAuth Budgets** (draft-hardt-aauth-budgets, editor's copy) — the resource

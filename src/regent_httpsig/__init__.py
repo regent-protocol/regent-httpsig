@@ -14,6 +14,14 @@ from regent_httpsig.budget import (
 from regent_httpsig.config import HttpsigConfig
 from regent_httpsig.jwk import b64url, jwk_thumbprint, load_ed25519_jwk
 from regent_httpsig.netguard import NotPublicURL, assert_public_url
+from regent_httpsig.usage import (
+    ResponseSigner,
+    UsageQueryError,
+    build_usage_response,
+    make_usage_endpoint,
+    parse_usage_request,
+    validate_budget_grant,
+)
 from regent_httpsig.sfv import (
     build_aauth_budget_header,
     build_aauth_requirement,
@@ -40,6 +48,12 @@ __all__ = [
     "__version__",
     "assert_public_url",
     "b64url",
+    "ResponseSigner",
+    "UsageQueryError",
+    "build_usage_response",
+    "make_usage_endpoint",
+    "parse_usage_request",
+    "validate_budget_grant",
     "build_aauth_budget_header",
     "build_aauth_requirement",
     "generate_seed",

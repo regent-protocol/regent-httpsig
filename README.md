@@ -138,6 +138,37 @@ The only thing the library cannot do for you is pricing (`price_fn`) — that
 is your domain. First known implementation of the draft; running in
 production on [get4agent.com](https://get4agent.com).
 
+**The August 20 additions** are covered too:
+
+- `insufficient-budget` refusals carry **`required`** — the refused request's
+  maximum cost — so the agent lowers its bound and retries instead of guessing.
+- **Streaming** responses run in the draft's cost-omitted mode: `reserved` in
+  the header, commit when the stream ends (set `request.state.budget_cost`
+  mid-stream if you learn the actual), and the agent recovers the exact cost
+  from the next response's `remaining`.
+- The **usage endpoint** (§Usage Counters) lets your PS query consumption
+  without the agent in the loop — scope counters (`sub`, UTC calendar buckets)
+  and per-key `jkts` totals, optionally signed:
+
+```python
+from regent_httpsig import InMemoryMeter, ResponseSigner, make_usage_endpoint
+
+handler = make_usage_endpoint(
+    meter,
+    authenticate_ps=my_ps_authenticator,   # verify the PS's jwks_uri signature
+    unit="USD", decimals=6,
+    signer=ResponseSigner(seed=SEED, jwks_url="https://api.example/jwks.json"),
+)
+
+@app.post("/usage")
+async def usage(request: Request):
+    return await handler(request)
+```
+
+- `validate_budget_grant(unit, decimals, budget_units)` enforces the resource
+  metadata MUSTs before you mint a resource token — the "thousandfold error"
+  guard.
+
 ## Security model (what a naive implementation gets wrong)
 
 The verifier fetches key directories from **attacker-nameable origins** — whoever signs a
