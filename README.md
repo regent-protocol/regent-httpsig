@@ -116,8 +116,10 @@ to the control plane. The middleware does the whole resource-side checklist:
 verify the token against your pinned PS, atomically reserve → commit →
 release per request, answer with `AAuth-Budget`, and refuse exhausted
 envelopes with a `401` + `AAuth-Requirement` (optionally carrying your signed
-resource token with the agent's own consumption records — scoped to its key,
-so one agent never learns about a sibling's spending):
+resource token with **one** consumption record — the presented token's
+`{jti, consumed}` — so one agent never learns about a sibling's spending).
+The cap is **per token**: a jti never draws on a sibling's grant; the
+`(iss, sub, aud)` key is only the per-person ledger behind records and usage:
 
 ```python
 from regent_httpsig import HttpsigConfig, HttpsigVerifier, InMemoryMeter

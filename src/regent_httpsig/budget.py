@@ -5,11 +5,23 @@ The auth token carries a spending envelope::
     "budget": { "amount": 2000000, "unit": "USD", "decimals": 6 }   # = $2.00
 
 and the resource meters every request against it: reserve the request's maximum
-cost atomically, serve, commit the actual cost, release the difference. The
-draft requires consumption to be aggregated atomically across all live auth
-tokens for the key ``(iss, sub, aud)`` (§14.4), so the meter pools the grants
-of a principal's live tokens and counts reservations + consumption against
-that pool.
+cost atomically, serve, commit the actual cost, release the difference.
+
+Two things are counted, against different keys (draft §Aggregation):
+
+* the **cap** is per auth token — committed consumption plus outstanding
+  reservations against the presented ``jti`` never exceed *its* ``budget``;
+  no cross-token arithmetic, one token never draws on a sibling's grant;
+* the **ledger** is per person — consumption is posted to ``(iss, sub, aud)``
+  for the consumption record and the usage counters. It is not a second
+  ceiling: a request that fits its token's budget is never refused because
+  of a per-person total.
+
+(0.4 and earlier pooled a principal's live grants into one purse. That let a
+jti spend past its own grant, so the figure recorded against it could exceed
+what its issuer granted and the overflow — spent from a sibling's allocation —
+was never attributed. Dropped in 0.5.0; the ``required`` member makes a
+fragmented agent's re-authorization a calculation instead.)
 
 Everything here is framework-free; the FastAPI glue lives in
 :mod:`regent_httpsig.fastapi` (``BudgetMiddleware``).
@@ -42,7 +54,7 @@ class InvalidBudgetClaim(ValueError):
 
 
 class UnitMismatch(ValueError):
-    """A grant's unit/decimals differ from the pool's — one envelope, one unit."""
+    """A grant's unit/decimals differ from the ledger's — one envelope, one unit."""
 
 
 @dataclass(frozen=True)
@@ -80,8 +92,8 @@ class BudgetClaim:
 
 @dataclass(frozen=True)
 class Reservation:
-    """An atomic hold on the pool for one in-flight request. Never revised —
-    committed (with the actual cost) or released, exactly once."""
+    """An atomic hold on one token's budget for one in-flight request. Never
+    revised — committed (with the actual cost) or released, exactly once."""
 
     rid: int
     key: MeterKey
@@ -91,7 +103,8 @@ class Reservation:
 
 @dataclass(frozen=True)
 class InsufficientBudget:
-    """Refusal: the request's maximum cost exceeds the pool's remaining balance.
+    """Refusal: the request's maximum cost exceeds the presented token's
+    remaining balance.
     ``exhausted`` distinguishes the draft's two reason tokens: an empty envelope
     (``budget-exhausted``) vs a too-expensive request (``insufficient-budget``)."""
 
@@ -204,21 +217,25 @@ class InMemoryMeter:
         return pool
 
     @staticmethod
-    def _remaining(pool: _Pool) -> int:
-        live = sum(a for a, _ in pool.grants.values())
-        spent = sum(pool.consumed.get(jti, 0) for jti in pool.grants)
-        held = sum(a for _, a, _ in pool.reservations.values())
-        return max(0, live - spent - held)
+    def _remaining(pool: _Pool, jti: str) -> int:
+        """The presented token's balance: its grant minus what was committed
+        against it minus what is held for it. Sibling tokens of the same
+        person do not enter — the cap is per token (§Aggregation)."""
+        grant = pool.grants.get(jti)
+        if grant is None:
+            return 0
+        held = sum(a for j, a, _ in pool.reservations.values() if j == jti)
+        return max(0, grant[0] - pool.consumed.get(jti, 0) - held)
 
     # ── public interface (the BudgetMeter contract) ──────────────────────────
 
     async def observe_grant(self, key: MeterKey, jti: str, claim: BudgetClaim,
                             exp: float, jkt: str = "") -> None:
-        """Register a token's envelope in the principal's pool (idempotent per
-        ``jti``). ``jkt`` is the RFC 7638 thumbprint of the token's ``cnf`` key —
+        """Register a token's envelope under the person's ledger key (idempotent
+        per ``jti``). ``jkt`` is the RFC 7638 thumbprint of the token's ``cnf`` key —
         recorded so consumption records can be scoped to the presenting agent
         (one agent must not learn about its siblings). Raises
-        :class:`UnitMismatch` if the pool already runs in a different unit —
+        :class:`UnitMismatch` if the ledger already runs in a different unit —
         one envelope, one unit, no FX at the meter."""
         async with self._lock:
             now = time.monotonic()
@@ -229,7 +246,7 @@ class InMemoryMeter:
                     key, _Pool(unit=claim.unit, decimals=claim.decimals))
             if (pool.unit, pool.decimals) != (claim.unit, claim.decimals):
                 raise UnitMismatch(
-                    f"pool runs in {pool.unit}/{pool.decimals}, "
+                    f"ledger runs in {pool.unit}/{pool.decimals}, "
                     f"grant is {claim.unit}/{claim.decimals}")
             pool.last_activity = now
             if jkt:
@@ -244,7 +261,7 @@ class InMemoryMeter:
             pool = self._purge(key, now)
             if pool is None or jti not in pool.grants:
                 return InsufficientBudget(remaining=0, exhausted=True)
-            remaining = self._remaining(pool)
+            remaining = self._remaining(pool, jti)
             if max_cost > remaining:
                 return InsufficientBudget(remaining=remaining,
                                           exhausted=remaining == 0)
@@ -255,7 +272,7 @@ class InMemoryMeter:
 
     async def commit(self, res: Reservation, actual: int) -> int:
         """Commit the actual cost (clamped to the reserved amount — reservations
-        are never revised upward) and return the pool's remaining balance."""
+        are never revised upward) and return the token's remaining balance."""
         async with self._lock:
             now = time.monotonic()
             pool = self._purge(res.key, now)
@@ -267,7 +284,7 @@ class InMemoryMeter:
             pool.last_activity = now
             if cost > 0:
                 self._record_usage(res.key, pool, res.jti, cost)
-            return self._remaining(pool)
+            return self._remaining(pool, res.jti)
 
     async def release(self, res: Reservation) -> int:
         async with self._lock:
@@ -275,12 +292,14 @@ class InMemoryMeter:
             if pool is None:
                 return 0
             pool.reservations.pop(res.rid, None)
-            return self._remaining(pool)
+            return self._remaining(pool, res.jti)
 
-    async def remaining(self, key: MeterKey) -> int:
+    async def remaining(self, key: MeterKey, jti: str) -> int:
+        """The presented token's remaining balance (0 for an unknown or
+        expired ``jti``)."""
         async with self._lock:
             pool = self._purge(key, time.monotonic())
-            return 0 if pool is None else self._remaining(pool)
+            return 0 if pool is None else self._remaining(pool, jti)
 
     def _record_usage(self, key: MeterKey, pool: _Pool, jti: str,
                       amount: int) -> None:
@@ -322,11 +341,25 @@ class InMemoryMeter:
         or ``None`` before the first commit."""
         return self._metering_unit
 
+    async def consumed_record(self, key: MeterKey, jti: str) -> dict[str, Any] | None:
+        """The consumption record for the resource token's ``budget_consumed``
+        claim (draft §The Consumption Record): ``{"jti", "consumed"}`` for the
+        PRESENTED token — its total metered so far — or ``None`` when nothing
+        was metered against it. One record, the presented token's; the spend
+        under a person's other tokens is the usage endpoint's to report."""
+        async with self._lock:
+            pool = self._purge(key, time.monotonic())
+            if pool is None:
+                return None
+            total = pool.consumed.get(jti, 0)
+            return {"jti": jti, "consumed": total} if total > 0 else None
+
     async def consumed_records(self, key: MeterKey,
                                jkt: str | None = None) -> list[dict[str, Any]]:
-        """Per-token consumption for the resource token's ``budget_consumed``
-        claim: ``[{"jti": ..., "consumed": ...}, ...]``. Non-destructive — the
-        PS deduplicates by ``jti``, so reporting the same record twice is safe.
+        """Audit view: per-token consumption under this ledger key,
+        ``[{"jti": ..., "consumed": ...}, ...]``. Not what goes on the wire —
+        the resource token carries :meth:`consumed_record` — but the figures a
+        PS-side reconciliation or an operator wants to see.
 
         When ``jkt`` is given, records are scoped to tokens bound to that key:
         the agent carrying the resource token sees only its OWN spending, never

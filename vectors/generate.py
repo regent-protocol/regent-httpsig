@@ -87,15 +87,16 @@ def budget_claim() -> dict:
 
 def consumption_records() -> dict:
     return {
-        "budget_consumed": [
-            {"jti": "at-2", "consumed": 431200},
-            {"jti": "at-1", "consumed": 221200},
-        ],
+        "budget_consumed": {"jti": "at-2", "consumed": 431200},
         "notes": [
-            "two members and no more — the PS joins the rest from its ledger",
-            "records are scoped to the presenting agent's key (jkt): one "
-            "agent never learns a sibling's spending",
-            "most recent first; SHOULD NOT exceed 20 records",
+            "ONE record — the presented token's — two members and no more; "
+            "the issuer joins the rest from its ledger (#120)",
+            "consumed is that token's total as of the resource token's iat",
+            "final vs snapshot is decided by the issuer: resource token iat >= "
+            "auth token exp is the final figure and releases the remainder; "
+            "a record on a live token releases nothing",
+            "the spend under a person's other tokens is the usage endpoint's "
+            "to report — never carried by a sibling",
         ],
     }
 

@@ -122,7 +122,7 @@ RequiredSignatureDep = Depends(require_signature)
 
 PriceFn = Callable[[Request], "int | None | Awaitable[int | None]"]
 ResourceTokenProvider = Callable[
-    [MeterKey, "list[dict[str, Any]]"], "str | None | Awaitable[str | None]"
+    [MeterKey, "dict[str, Any] | None"], "str | None | Awaitable[str | None]"
 ]
 
 
@@ -158,9 +158,12 @@ class BudgetMiddleware(BaseHTTPMiddleware):
       ``require=True`` refuses them with 401 + ``AAuth-Requirement``.
     - Error responses (4xx/5xx) release the reservation — nothing was served,
       the envelope is not charged.
-    - ``resource_token_provider(key, consumed_records)`` (optional) mints the
-      resource token embedded in budget-refusal responses so the agent can
-      carry ``budget_consumed`` back to its PS for re-authorization.
+    - ``resource_token_provider(key, record)`` (optional) mints the resource
+      token embedded in budget-refusal responses so the agent can carry
+      ``budget_consumed`` back to its PS for re-authorization. ``record`` is
+      the PRESENTED token's ``{"jti", "consumed"}`` (draft §The Consumption
+      Record — one record, two members) or ``None`` when nothing was metered
+      against it yet.
     """
 
     def __init__(
@@ -223,7 +226,7 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             reason = "budget-exhausted" if outcome.exhausted else "insufficient-budget"
             return await self._refusal_with_token(
                 reason=reason, envelope=envelope, remaining=outcome.remaining,
-                key=key, jkt=sig.keyid,
+                key=key, jti=jti,
                 # `required` rides only on insufficient-budget: what THIS
                 # request needed, so the agent can lower its bound and retry.
                 required=int(max_cost) if reason == "insufficient-budget" else None,
@@ -247,7 +250,7 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             # when `cost` is omitted — with `remaining` already net of the
             # hold, and commit when the stream completes. The agent recovers
             # the exact figure from the next response's `remaining`.
-            remaining = await self._meter.remaining(key)
+            remaining = await self._meter.remaining(key, jti)
             response.headers["AAuth-Budget"] = build_aauth_budget_header(
                 remaining=remaining, reserved=int(max_cost),
                 unit=envelope.unit, decimals=envelope.decimals,
@@ -311,14 +314,17 @@ class BudgetMiddleware(BaseHTTPMiddleware):
 
     async def _refusal_with_token(
         self, *, reason: str, envelope: BudgetClaim,
-        remaining: int, key: MeterKey, jkt: str | None = None,
+        remaining: int, key: MeterKey, jti: str,
         required: int | None = None,
     ) -> Response:
         token: str | None = None
         if self._resource_token is not None:
             try:
-                records = await self._meter.consumed_records(key, jkt=jkt)
-                token = await _maybe_await(self._resource_token(key, records))
+                # One record, the presented token's (§The Consumption Record):
+                # what THIS jti has cost so far. Siblings' spend never rides
+                # home with this agent — the usage endpoint reports that.
+                record = await self._meter.consumed_record(key, jti)
+                token = await _maybe_await(self._resource_token(key, record))
             except Exception:  # noqa: BLE001 — refusal must not fail on the extras
                 logger.warning("resource_token_provider failed", exc_info=True)
         return self._refusal(reason=reason, envelope=envelope,

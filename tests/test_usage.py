@@ -142,7 +142,7 @@ async def test_expired_reservation_reaches_usage_counters() -> None:
     await meter.observe_grant(KEY, "jti-1", CLAIM, time.time() + 3600, jkt=JKT_A)
     await meter.reserve(KEY, "jti-1", 700)
     await asyncio.sleep(0.02)
-    await meter.remaining(KEY)  # triggers the purge
+    await meter.remaining(KEY, "jti-1")  # triggers the purge
     assert (await meter.usage_keys(KEY[0], [JKT_A]))[JKT_A] == 700
 
 

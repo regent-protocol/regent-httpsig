@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.0
+
+**AAuth Budgets — per-token cap, one consumption record** (draft-hardt-aauth-budgets
+editor's copy, September 2026; issue #120):
+
+- **No more pooling.** `InMemoryMeter` caps each auth token at its own `budget`
+  (§Aggregation): committed consumption plus outstanding reservations against
+  the presented `jti` never exceed *its* grant, and a token never draws on a
+  sibling's allocation. The `(iss, sub, aud)` key survives as the per-person
+  **ledger** for records and usage counters — it is not a second ceiling.
+  0.4 pooled a person's live grants into one purse, which let a jti spend past
+  its own grant; the overflow, spent from a sibling's allocation, was never
+  attributed and the sibling's remainder later released as unspent. The
+  `required` member makes a fragmented agent's re-authorization a calculation,
+  so the purse bought nothing worth that.
+- **One record on the wire.** Budget refusals carry a single
+  `budget_consumed` object — `{"jti", "consumed"}` for the PRESENTED token —
+  per §The Consumption Record. New `InMemoryMeter.consumed_record(key, jti)`;
+  `consumed_records(key, jkt=…)` stays as the audit view.
+- **Breaking:** `InMemoryMeter.remaining(key)` → `remaining(key, jti)`;
+  `resource_token_provider(key, records: list)` → `(key, record: dict | None)`.
+  `InsufficientBudget.remaining` is now the presented token's balance.
+- Test vectors regenerated (`consumption_records` is one object).
+
 ## 0.4.0
 
 **AAuth Budgets — the August 20 editor's-copy additions** (allocation model,

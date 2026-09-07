@@ -105,19 +105,29 @@ async def test_meter_reserve_commit_release_math() -> None:
     await meter.observe_grant(KEY, "jti-1", _claim(1000), time.time() + 60)
     res = await meter.reserve(KEY, "jti-1", 300)
     assert isinstance(res, Reservation)
-    assert await meter.remaining(KEY) == 700  # 300 held
+    assert await meter.remaining(KEY, "jti-1") == 700  # 300 held
     assert await meter.commit(res, 120) == 880  # difference released
     assert await meter.consumed_records(KEY) == [{"jti": "jti-1", "consumed": 120}]
 
 
-async def test_meter_pools_across_live_tokens() -> None:
-    """The draft's (iss, sub, aud) aggregation: two live envelopes pool."""
+async def test_meter_caps_each_token_at_its_own_budget() -> None:
+    """§Aggregation: the cap is per auth token. Two live envelopes of one
+    person do NOT pool — a jti never draws on a sibling's grant, so the
+    figure recorded against it can never exceed what its issuer granted."""
     meter = InMemoryMeter()
     await meter.observe_grant(KEY, "a", _claim(300), time.time() + 60)
     await meter.observe_grant(KEY, "b", _claim(300), time.time() + 60)
-    res = await meter.reserve(KEY, "a", 500)  # more than either grant alone
+    refusal = await meter.reserve(KEY, "a", 500)  # would have fit a pooled purse
+    assert isinstance(refusal, InsufficientBudget)
+    assert refusal.remaining == 300 and not refusal.exhausted
+    res = await meter.reserve(KEY, "a", 300)
     assert isinstance(res, Reservation)
-    assert await meter.commit(res, 500) == 100
+    assert await meter.commit(res, 300) == 0          # a is spent…
+    assert await meter.remaining(KEY, "b") == 300      # …b is untouched
+    assert await meter.consumed_record(KEY, "a") == {"jti": "a", "consumed": 300}
+    assert await meter.consumed_record(KEY, "b") is None
+    # The ledger still aggregates per person for records/usage.
+    assert await meter.consumed_records(KEY) == [{"jti": "a", "consumed": 300}]
 
 
 async def test_meter_insufficient_vs_exhausted() -> None:
@@ -163,7 +173,7 @@ async def test_meter_expired_reservation_counts_as_consumed() -> None:
     res = await meter.reserve(KEY, "jti-1", 400)
     assert isinstance(res, Reservation)
     # Handler "crashed": never commits. The next touch resolves it as consumed.
-    assert await meter.remaining(KEY) == 600
+    assert await meter.remaining(KEY, "jti-1") == 600
     assert await meter.consumed_records(KEY) == [{"jti": "jti-1", "consumed": 400}]
 
 
@@ -176,9 +186,9 @@ async def test_meter_commit_clamps_to_reservation() -> None:
 
 
 async def test_consumed_records_scoped_to_presenting_jkt() -> None:
-    """Two agents of one principal share the (iss, sub, aud) pool, but each
-    sees only ITS OWN consumption records — never its siblings' (privacy +
-    no extra figures to infer the ceiling from)."""
+    """Two agents of one person post to the same (iss, sub, aud) ledger, but
+    each sees only ITS OWN consumption records — never its siblings' (privacy
+    + no extra figures to infer the ceiling from)."""
     meter = InMemoryMeter()
     now = time.time()
     await meter.observe_grant(KEY, "jti-a", _claim(500), now + 60, jkt="jkt-agent-A")
@@ -194,15 +204,16 @@ async def test_consumed_records_scoped_to_presenting_jkt() -> None:
     assert await meter.consumed_records(KEY, jkt="jkt-agent-B") == [
         {"jti": "jti-b", "consumed": 250}
     ]
-    # Unscoped (PS-side / audit view) still returns the whole pool.
+    # Unscoped (PS-side / audit view) still returns the whole ledger.
     assert len(await meter.consumed_records(KEY)) == 2
 
 
 async def test_refusal_records_scoped_to_presenter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The resource token embedded in a refusal carries only the presenting
-    agent's records: sibling B's spend must not ride home with agent A."""
+    """The resource token embedded in a refusal carries ONE record — the
+    presented token's (§The Consumption Record): sibling A's spend must not
+    ride home with agent B, and B's other tokens don't either."""
     ps_priv, ps_jwk = _ps_pair()
     agent_a = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
     agent_b = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
@@ -216,15 +227,16 @@ async def test_refusal_records_scoped_to_presenter(
 
     app = _app(_verifier(ps_jwk, monkeypatch), resource_token_provider=provider)
 
-    # A spends 300 (price of /v1/search), B spends 300 — pool now at 200.
+    # A spends 300 (price of /v1/search) of its 400; B spends 300 of its 400.
     assert (await _post(app, "/v1/search",
                         _signed_headers(agent_a, token_a, "/v1/search"))).status_code == 200
     assert (await _post(app, "/v1/search",
                         _signed_headers(agent_b, token_b, "/v1/search"))).status_code == 200
-    # B asks again: 300 > 200 remaining → refusal with records — B's only.
+    # B asks again: 300 > 100 remaining on at-B → refusal carrying at-B's record only.
     r = await _post(app, "/v1/search", _signed_headers(agent_b, token_b, "/v1/search"))
     assert r.status_code == 401
-    assert provider_records == [[{"jti": "at-B", "consumed": 300}]]
+    assert provider_records == [{"jti": "at-B", "consumed": 300}]
+    assert r.headers["AAuth-Budget"] == 'remaining=100, required=300, unit="KZT", decimals=2'
 
 
 async def test_meter_concurrent_reserves_never_oversell() -> None:
@@ -380,7 +392,7 @@ async def test_middleware_refuses_when_insufficient(
     assert (r2.headers["AAuth-Budget"] ==
             'remaining=200, required=300, unit="KZT", decimals=2')
     assert provider_calls and provider_calls[0][0] == (PS_ISS, "owner-1", RESOURCE)
-    assert provider_calls[0][1] == [{"jti": "at-1", "consumed": 300}]
+    assert provider_calls[0][1] == {"jti": "at-1", "consumed": 300}  # one record (#120)
 
 
 async def test_middleware_actual_cost_from_handler(
