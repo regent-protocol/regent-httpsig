@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import time
-from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey

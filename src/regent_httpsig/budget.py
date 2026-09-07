@@ -33,8 +33,8 @@ import asyncio
 import itertools
 import time
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 __all__ = [
@@ -190,7 +190,8 @@ class InMemoryMeter:
         # request" — so a key in continuous use is never pruned.
         self._usage_key_retention = usage_key_retention
         self._scope_usage: dict[tuple[str, str], _ScopeCounters] = {}  # (iss, sub)
-        self._key_usage: dict[tuple[str, str], tuple[int, float]] = {}  # (iss, jkt) -> (total, last_wall)
+        # (iss, jkt) -> (total, last_wall)
+        self._key_usage: dict[tuple[str, str], tuple[int, float]] = {}
         self._metering_unit: tuple[str, int] | None = None
 
     # ── internals (call under lock) ──────────────────────────────────────────

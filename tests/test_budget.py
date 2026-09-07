@@ -489,7 +489,8 @@ async def test_streaming_cost_omitted_reserved_math(
 
     r1 = await _post(app, "/v1/stream", _signed_headers(agent, token, "/v1/stream"))
     assert r1.status_code == 200
-    d1 = SFDictionary(); d1.parse(r1.headers["AAuth-Budget"].encode())
+    d1 = SFDictionary()
+    d1.parse(r1.headers["AAuth-Budget"].encode())
     assert "cost" not in d1                      # omitted — no trailer runtime
     assert int(str(d1["reserved"].value)) == 300  # REQUIRED when cost omitted
     assert int(str(d1["remaining"].value)) == 700  # net of the hold
@@ -497,9 +498,9 @@ async def test_streaming_cost_omitted_reserved_math(
 
     # Stream ended → the actual 120 was committed, 180 returned to the grant.
     r2 = await _post(app, "/v1/search", _signed_headers(agent, token, "/v1/search"))
-    d2 = SFDictionary(); d2.parse(r2.headers["AAuth-Budget"].encode())
+    d2 = SFDictionary()
+    d2.parse(r2.headers["AAuth-Budget"].encode())
     next_remaining = int(str(d2["remaining"].value)) + 300  # add back r2's own cost
-    recovered = 1000 + 300 - 700 - (1000 - next_remaining)  # draft's subtraction…
     assert 700 + 300 - next_remaining == 120     # …prev + reserved − next = cost
 
 
