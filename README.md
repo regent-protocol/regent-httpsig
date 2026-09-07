@@ -144,6 +144,11 @@ production on [get4agent.com](https://get4agent.com).
 
 - `insufficient-budget` refusals carry **`required`** — the refused request's
   maximum cost — so the agent lowers its bound and retries instead of guessing.
+- An **expired** auth token gets the base protocol's plain challenge with a
+  resource token carrying that token's **final** consumption record — the
+  figure its issuer needs to settle the allocation (a record stated at or
+  after `exp` is final; one on a live token is a snapshot and releases
+  nothing).
 - **Streaming** responses run in the draft's cost-omitted mode: `reserved` in
   the header, commit when the stream ends (set `request.state.budget_cost`
   mid-stream if you learn the actual), and the agent recovers the exact cost

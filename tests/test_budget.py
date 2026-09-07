@@ -266,11 +266,13 @@ def _ps_pair() -> tuple[Ed25519PrivateKey, dict[str, Any]]:
 
 
 def _auth_token(ps_priv: Ed25519PrivateKey, agent: EgressSigner, *,
-                amount: int, jti: str = "at-1") -> str:
+                amount: int, jti: str = "at-1", age: int = 0) -> str:
+    """``age`` > 600 mints a token that has ALREADY expired (iat/exp shifted
+    into the past) — genuine, possession-bound, not valid for access."""
     from regent_httpsig.verify import _register_fully_specified_algs
 
     _register_fully_specified_algs()  # PyJWT knows "Ed25519" only after this
-    now = int(time.time())
+    now = int(time.time()) - age
     return pyjwt.encode(
         {
             "iss": PS_ISS, "sub": "owner-1", "aud": RESOURCE, "jti": jti,
@@ -499,3 +501,70 @@ async def test_streaming_cost_omitted_reserved_math(
     next_remaining = int(str(d2["remaining"].value)) + 300  # add back r2's own cost
     recovered = 1000 + 300 - 700 - (1000 - next_remaining)  # draft's subtraction…
     assert 700 + 300 - next_remaining == 120     # …prev + reserved − next = cost
+
+
+async def test_expired_token_gets_final_record_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§Budget Exhaustion, "auth token expired": plain requirement=auth-token
+    (no reason) + a resource token carrying the token's FINAL record — the
+    figure the issuer needs to settle the allocation (§Settlement: a record
+    stated at/after exp is final)."""
+    ps_priv, ps_jwk = _ps_pair()
+    agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
+    live = _auth_token(ps_priv, agent, amount=1000, jti="at-9")
+    provider_calls: list[Any] = []
+
+    def provider(key: Any, record: Any) -> str:
+        provider_calls.append((key, record))
+        return "resource.token.final"
+
+    meter = InMemoryMeter()
+    app = _app(_verifier(ps_jwk, monkeypatch), meter=meter,
+               resource_token_provider=provider)
+    # Spend 300 on the live token, so there is a figure to carry.
+    r = await _post(app, "/v1/search", _signed_headers(agent, live, "/v1/search"))
+    assert r.status_code == 200
+
+    # The same jti, now past its exp (same issuer, same key, same claims).
+    stale = _auth_token(ps_priv, agent, amount=1000, jti="at-9", age=700)
+    r = await _post(app, "/v1/search", _signed_headers(agent, stale, "/v1/search"))
+    assert r.status_code == 401
+    assert r.json()["code"] == "AUTH_TOKEN_EXPIRED"
+    assert (r.headers["AAuth-Requirement"]
+            == 'requirement=auth-token;resource-token="resource.token.final"')
+    assert "AAuth-Budget" not in r.headers  # the budget didn't run out; the token did
+    assert provider_calls[-1] == ((PS_ISS, "owner-1", RESOURCE),
+                                  {"jti": "at-9", "consumed": 300})
+    # Nothing was served and nothing more was metered.
+    assert await meter.consumed_record(
+        (PS_ISS, "owner-1", RESOURCE), "at-9") == {"jti": "at-9", "consumed": 300}
+
+
+async def test_expired_token_past_grace_is_no_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Beyond the grace window there is no figure left to carry: the token is
+    just an unknown one and the request falls through as unsigned."""
+    ps_priv, ps_jwk = _ps_pair()
+    agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
+    ancient = _auth_token(ps_priv, agent, amount=1000, jti="at-old", age=3 * 3600)
+    app = _app(_verifier(ps_jwk, monkeypatch), require=True)
+    r = await _post(app, "/v1/search", _signed_headers(agent, ancient, "/v1/search"))
+    assert r.status_code == 401 and r.json()["code"] == "AUTH_TOKEN_REQUIRED"
+
+
+async def test_plain_verify_still_rejects_expired_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tolerance is opt-in for the budgets middleware only: an access
+    decision through ``verify()`` never sees an expired token as verified."""
+    ps_priv, ps_jwk = _ps_pair()
+    agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
+    stale = _auth_token(ps_priv, agent, amount=1000, jti="at-9", age=700)
+    verifier = _verifier(ps_jwk, monkeypatch)
+    headers = _signed_headers(agent, stale, "/v1/search")
+    assert await verifier.verify("POST", f"{RESOURCE}/v1/search", headers) is None
+    sig = await verifier.verify("POST", f"{RESOURCE}/v1/search", headers,
+                                allow_expired_auth_token=True)
+    assert sig is not None and sig.expired

@@ -61,6 +61,10 @@ AAUTH_PERSON_TYP = "aa-person+jwt"
 AAUTH_AUTH_TYP = "aa-auth+jwt"  # PS-issued auth tokens — the budget carrier
 # -11: person and auth tokens live at most one hour — enforced with tolerance.
 PERSON_TOKEN_MAX_LIFETIME = 3600 + 90
+# How long after its exp an auth token still earns the budgets "final record"
+# challenge (opt-in, BudgetMiddleware only): the meter retains consumption for
+# about this long after last activity; beyond it there is no figure to carry.
+EXPIRED_AUTH_TOKEN_GRACE = 7200
 
 
 def _register_fully_specified_algs() -> None:
@@ -86,6 +90,11 @@ class VerifiedSignature:
     sub: str | None = None  # AAuth agent id (token `sub`)
     label: str = ""
     claims: dict[str, Any] = field(default_factory=dict)  # AAuth token claims (redacted)
+    # Set only when ``verify(..., allow_expired_auth_token=True)`` accepted an
+    # auth token PAST its exp: genuine (issuer signature + proof of possession
+    # verified) but NOT valid for access. BudgetMiddleware uses it to answer
+    # with the final-record challenge; nothing else should ever see it True.
+    expired: bool = False
 
     def context(self) -> dict[str, Any]:
         """A flat dict suitable for logging / policy engines / audit trails."""
@@ -164,18 +173,28 @@ class HttpsigVerifier:
         self._cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
     async def verify(
-        self, method: str, url: str, headers: Mapping[str, str]
+        self, method: str, url: str, headers: Mapping[str, str],
+        *, allow_expired_auth_token: bool = False,
     ) -> VerifiedSignature | None:
         """Verify the request's agent signature. Returns ``None`` when there is
         no ``Signature`` header, the signature is invalid, or the signer's keys
-        cannot be (safely) fetched — never raises on untrusted input."""
+        cannot be (safely) fetched — never raises on untrusted input.
+
+        ``allow_expired_auth_token`` (default False — leave it so for access
+        decisions) lets a genuine ``aa-auth+jwt`` past its ``exp`` come back
+        with ``expired=True`` instead of ``None``, for up to
+        :data:`EXPIRED_AUTH_TOKEN_GRACE` seconds. Budgets need this: the
+        resource owes the holder of an expired token a challenge carrying that
+        token's final consumption record (draft §Budget Exhaustion), and it
+        cannot build one for a token it refused to look at."""
         hdrs = {str(k): str(v) for k, v in headers.items()}
         if not any(k.lower() == "signature" for k in hdrs):
             return None
         result: VerifiedSignature | None = None
         try:
             if any(k.lower() == "signature-key" for k in hdrs):
-                result = await self._verify_aauth(method, url, hdrs)
+                result = await self._verify_aauth(
+                    method, url, hdrs, allow_expired_auth_token=allow_expired_auth_token)
             if result is None:
                 result = await self._verify_web_bot_auth(method, url, hdrs)
         except Exception as exc:  # noqa: BLE001 — belt and braces
@@ -288,7 +307,8 @@ class HttpsigVerifier:
     # ── AAuth (identity-based mode) ──────────────────────────────────────────
 
     async def _verify_aauth(
-        self, method: str, url: str, headers: dict[str, str]
+        self, method: str, url: str, headers: dict[str, str],
+        *, allow_expired_auth_token: bool = False,
     ) -> VerifiedSignature | None:
         try:
             import jwt as pyjwt  # the [aauth] extra
@@ -387,6 +407,7 @@ class HttpsigVerifier:
                         continue
         if issuer_key is None:
             return None
+        tolerate_exp = allow_expired_auth_token and typ == AAUTH_AUTH_TYP
         try:
             claims = pyjwt.decode(
                 token,
@@ -396,11 +417,20 @@ class HttpsigVerifier:
                 options={
                     "require": ["iss", "sub", "exp", "iat"],
                     "verify_aud": audience is not None,
+                    "verify_exp": not tolerate_exp,
                 },
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("aauth token invalid iss=%s: %s", iss, str(exc)[:200])
             return None
+        expired = False
+        if tolerate_exp:
+            overdue = int(time.time()) - int(claims.get("exp", 0))
+            expired = overdue >= 0
+            if overdue > EXPIRED_AUTH_TOKEN_GRACE:
+                logger.info("aauth auth token expired %ss ago — past grace iss=%s",
+                            overdue, iss)
+                return None
 
         # -11: person and auth tokens live at most one hour.
         if typ in (AAUTH_PERSON_TYP, AAUTH_AUTH_TYP):
@@ -456,4 +486,5 @@ class HttpsigVerifier:
                           "budget")  # budgets: the envelope rides in the token
                 if k in claims
             },
+            expired=expired,
         )

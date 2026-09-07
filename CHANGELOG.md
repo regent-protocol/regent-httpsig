@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.1
+
+**Budgets — the final-record challenge for expired auth tokens** (draft
+§Budget Exhaustion "auth token expired" + §Settlement). The final/snapshot
+settlement rule needs a moment at which the resource *states* a token's final
+figure — and that moment is the challenge to an expired token. A verifier that
+refuses to look at an expired token can never build it, so the issuer never
+sees a final record and accounts every allocation as fully consumed forever.
+
+- `BudgetMiddleware` answers a genuine-but-expired `aa-auth+jwt` (issuer
+  signature and proof of possession verified, request signature fresh) with
+  `401` + plain `AAuth-Requirement: requirement=auth-token;resource-token=…`
+  (no `reason` — the budget didn't run out, the token did) and `code:
+  AUTH_TOKEN_EXPIRED`. The resource token carries the presented token's
+  `{jti, consumed}`; no `AAuth-Budget` header. Nothing is served or metered.
+- `HttpsigVerifier.verify(..., allow_expired_auth_token=True)` — **opt-in,
+  default False**: returns the token with `VerifiedSignature.expired=True`
+  for up to `EXPIRED_AUTH_TOKEN_GRACE` (2h, the meter's retention) after
+  `exp`. Access decisions through `verify()`/`require_signature` are
+  unchanged: an expired token is still `None` there, and the middleware never
+  caches an expired result for downstream dependencies.
+- `build_aauth_requirement(reason=None, …)` emits the reason-less challenge.
+
 ## 0.5.0
 
 **AAuth Budgets — per-token cap, one consumption record** (draft-hardt-aauth-budgets

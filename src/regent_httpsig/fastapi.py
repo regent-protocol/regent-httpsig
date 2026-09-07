@@ -191,6 +191,13 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         sig = await self._verified(request)
+        if sig is not None and sig.expired:
+            # §Budget Exhaustion, "auth token expired": the base protocol's plain
+            # 401 — and the resource token we attach carries the presented
+            # token's FINAL consumption record (stated at/after its exp), which
+            # is what lets its issuer settle the allocation exactly. Without
+            # this challenge an issuer never sees a final figure at all.
+            return await self._expired_challenge(sig)
         envelope: BudgetClaim | None = None
         if sig is not None:
             try:
@@ -307,10 +314,41 @@ class BudgetMiddleware(BaseHTTPMiddleware):
         result = None
         if "signature" in request.headers:
             result = await self._verifier.verify(
-                request.method, _public_url(request), dict(request.headers)
+                request.method, _public_url(request), dict(request.headers),
+                allow_expired_auth_token=True,
             )
-        request.state.regent_httpsig_result = result
+        # An expired token is never handed to the app: the middleware answers
+        # it with the final-record challenge and nothing downstream runs. The
+        # per-request cache still must not carry it — a later dependency
+        # reading the cache would otherwise see a token that is not valid.
+        request.state.regent_httpsig_result = (
+            None if result is not None and result.expired else result)
         return result
+
+    async def _expired_challenge(self, sig: VerifiedSignature) -> Response:
+        jti = str(sig.claims.get("jti") or "")
+        key: MeterKey = (
+            str(sig.claims.get("iss", "")),
+            str(sig.claims.get("sub", "")),
+            str(sig.claims.get("aud", "")),
+        )
+        token: str | None = None
+        if self._resource_token is not None and jti:
+            try:
+                record = await self._meter.consumed_record(key, jti)
+                token = await _maybe_await(self._resource_token(key, record))
+            except Exception:  # noqa: BLE001 — the challenge must not fail on the extras
+                logger.warning("resource_token_provider failed", exc_info=True)
+        return JSONResponse(
+            status_code=401,
+            content={
+                "code": "AUTH_TOKEN_EXPIRED",
+                "message": "The auth token has expired. Take the resource token in "
+                           "AAuth-Requirement to your PS for a fresh one.",
+            },
+            headers={"AAuth-Requirement": build_aauth_requirement(
+                reason=None, resource_token=token)},
+        )
 
     async def _refusal_with_token(
         self, *, reason: str, envelope: BudgetClaim,

@@ -176,13 +176,18 @@ def build_aauth_budget_header(
     return ", ".join(members)
 
 
-def build_aauth_requirement(*, reason: str, resource_token: str | None = None) -> str:
-    """Serialize ``AAuth-Requirement`` for a budget refusal:
+def build_aauth_requirement(*, reason: str | None,
+                            resource_token: str | None = None) -> str:
+    """Serialize ``AAuth-Requirement`` for a budget challenge:
     ``requirement=auth-token;resource-token="eyJ…";reason=insufficient-budget``.
-    ``reason`` is an sf-token (``insufficient-budget`` | ``budget-exhausted``);
-    the resource token (when the resource issues one) rides as an sf-string."""
+    ``reason`` is an sf-token (``insufficient-budget`` | ``budget-exhausted``)
+    for an exhaustion refusal, or ``None`` for the base protocol's plain
+    challenge (an EXPIRED auth token — the budget did not run out, the token
+    did); the resource token (when the resource issues one) rides as an
+    sf-string."""
     out = "requirement=auth-token"
     if resource_token:
         out += f";resource-token={_sf_string(resource_token)}"
-    out += f";reason={reason}"
+    if reason:
+        out += f";reason={reason}"
     return out
