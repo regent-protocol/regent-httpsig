@@ -221,3 +221,51 @@ def validate_budget_grant(unit: str, decimals: int,
                     f"(declared in budget_units), got {decimals}")
             return
     raise ValueError(f"unit {unit!r} is not declared in budget_units")
+
+
+def make_revocation_endpoint(
+    meter: Any,
+    *,
+    authenticate_ps: Callable[[Any], Awaitable[str | None]],
+) -> Callable[[Any], Awaitable[Any]]:
+    """The base protocol's revocation endpoint (§Token Revocation) for the
+    budgets meter: a signed ``POST`` identifying an auth token by
+    ``{"iss", "jti"}`` — both REQUIRED, keyed together because a jti is unique
+    only within its issuer. ``200`` when the token was revoked or is already
+    invalid here, ``404`` when the pair is not recognized. The body is
+    deliberately empty on success: the response must not vary with what the
+    recipient holds.
+
+    ``authenticate_ps`` is the same pinned-PS check the usage endpoint uses.
+    The issuer named in the body must be the caller: a PS revokes tokens it
+    issued, never another issuer's. What revocation does to the meter is in
+    :meth:`InMemoryMeter.revoke` — no new spend, in-flight requests complete,
+    and the token's consumption record is withheld until they have (AAuth
+    issue #151: a record issued after the revocation is then final)."""
+    from starlette.responses import JSONResponse, Response
+
+    async def handler(request: Any) -> Response:
+        caller = await authenticate_ps(request)
+        if caller is None:
+            return JSONResponse(status_code=401, content={
+                "code": "PS_AUTH_REQUIRED",
+                "message": "Sign the revocation as the person server that issued the token.",
+            })
+        try:
+            payload = json.loads(await request.body() or b"{}")
+            iss, jti = payload.get("iss"), payload.get("jti")
+            if not isinstance(iss, str) or not isinstance(jti, str) or not iss or not jti:
+                raise ValueError("iss and jti are REQUIRED strings")
+        except (ValueError, json.JSONDecodeError) as exc:
+            return JSONResponse(status_code=400, content={
+                "code": "INVALID_REVOCATION", "message": str(exc)})
+        if iss.rstrip("/") != caller.rstrip("/"):
+            return JSONResponse(status_code=403, content={
+                "code": "NOT_YOUR_TOKEN",
+                "message": "A person server may revoke only tokens it issued."})
+        if not await meter.revoke(iss, jti):
+            return JSONResponse(status_code=404, content={
+                "code": "TOKEN_UNKNOWN", "message": "No such (iss, jti) here."})
+        return Response(status_code=200)
+
+    return handler

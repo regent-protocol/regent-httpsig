@@ -43,6 +43,7 @@ __all__ = [
     "InsufficientBudget",
     "InvalidBudgetClaim",
     "Reservation",
+    "TokenRevoked",
     "UnitMismatch",
 ]
 
@@ -112,6 +113,17 @@ class InsufficientBudget:
     exhausted: bool
 
 
+@dataclass(frozen=True)
+class TokenRevoked:
+    """Refusal: the presented token was revoked (base protocol §Token
+    Revocation, budgets §Token Scope). The budget ended with the token — no
+    new spend — while requests already in flight complete. ``drained`` says
+    whether those have all settled: only then may the resource state the
+    token's consumption record, which is then FINAL (AAuth issue #151)."""
+
+    drained: bool
+
+
 @dataclass
 class _Pool:
     unit: str
@@ -120,6 +132,7 @@ class _Pool:
     consumed: dict[str, int] = field(default_factory=dict)  # jti -> total committed
     jkt_of: dict[str, str] = field(default_factory=dict)  # jti -> presenting key thumbprint
     reservations: dict[int, tuple[str, int, float]] = field(default_factory=dict)
+    revoked: dict[str, float] = field(default_factory=dict)  # jti -> wall time of revocation
     last_activity: float = 0.0
 
 
@@ -178,6 +191,7 @@ class InMemoryMeter:
                  retention_seconds: float = 7200.0,
                  usage_key_retention: float = 86400.0) -> None:
         self._pools: dict[MeterKey, _Pool] = {}
+        self._jti_index: dict[tuple[str, str], MeterKey] = {}  # (iss, jti) -> ledger key
         self._lock = asyncio.Lock()
         self._rids = itertools.count(1)
         self._reservation_ttl = reservation_ttl
@@ -214,8 +228,15 @@ class InMemoryMeter:
         if (not pool.grants and not pool.reservations
                 and now - pool.last_activity > self._retention):
             del self._pools[key]
+            for pair in [p for p, k in self._jti_index.items() if k == key]:
+                del self._jti_index[pair]
             return None
         return pool
+
+    @staticmethod
+    def _drained(pool: _Pool, jti: str) -> bool:
+        """No request is in flight on this token any more."""
+        return not any(j == jti for j, _, _ in pool.reservations.values())
 
     @staticmethod
     def _remaining(pool: _Pool, jti: str) -> int:
@@ -252,14 +273,17 @@ class InMemoryMeter:
             pool.last_activity = now
             if jkt:
                 pool.jkt_of.setdefault(jti, jkt)
-            if jti not in pool.grants and wall_delta > 0:
+            self._jti_index.setdefault((key[0], jti), key)
+            if jti not in pool.grants and wall_delta > 0 and jti not in pool.revoked:
                 pool.grants[jti] = (claim.amount, now + wall_delta)
 
     async def reserve(self, key: MeterKey, jti: str,
-                      max_cost: int) -> Reservation | InsufficientBudget:
+                      max_cost: int) -> Reservation | InsufficientBudget | TokenRevoked:
         async with self._lock:
             now = time.monotonic()
             pool = self._purge(key, now)
+            if pool is not None and jti in pool.revoked:
+                return TokenRevoked(drained=self._drained(pool, jti))
             if pool is None or jti not in pool.grants:
                 return InsufficientBudget(remaining=0, exhausted=True)
             remaining = self._remaining(pool, jti)
@@ -301,6 +325,33 @@ class InMemoryMeter:
         async with self._lock:
             pool = self._purge(key, time.monotonic())
             return 0 if pool is None else self._remaining(pool, jti)
+
+    async def revoke(self, iss: str, jti: str) -> bool:
+        """Revoke an auth token by ``(iss, jti)`` — the base protocol's
+        revocation identifier. The grant is withdrawn so no new request can
+        reserve against it; requests already in flight complete and are
+        committed as usual. ``False`` when the pair is unknown here (the
+        endpoint answers 404). Idempotent."""
+        async with self._lock:
+            key = self._jti_index.get((iss, jti))
+            if key is None:
+                return False
+            pool = self._purge(key, time.monotonic())
+            if pool is None:
+                return False
+            pool.revoked.setdefault(jti, time.time())
+            pool.grants.pop(jti, None)
+            pool.last_activity = time.monotonic()
+            return True
+
+    async def revocation_state(self, key: MeterKey, jti: str) -> TokenRevoked | None:
+        """``TokenRevoked`` (with its drain state) if the token was revoked
+        here, else ``None``."""
+        async with self._lock:
+            pool = self._purge(key, time.monotonic())
+            if pool is None or jti not in pool.revoked:
+                return None
+            return TokenRevoked(drained=self._drained(pool, jti))
 
     def _record_usage(self, key: MeterKey, pool: _Pool, jti: str,
                       amount: int) -> None:
@@ -351,6 +402,10 @@ class InMemoryMeter:
         async with self._lock:
             pool = self._purge(key, time.monotonic())
             if pool is None:
+                return None
+            if jti in pool.revoked and not self._drained(pool, jti):
+                # §Token Scope + AAuth #151: a revoked token's record is FINAL,
+                # so it is stated only once nothing is in flight on it.
                 return None
             total = pool.consumed.get(jti, 0)
             return {"jti": jti, "consumed": total} if total > 0 else None

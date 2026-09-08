@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.0
+
+**Budgets — revocation reaches the meter** (base protocol §Token Revocation,
+budgets §Token Scope; drain rule per AAuth issue #151, raised from our
+production and not yet in the editor's copy):
+
+- **`InMemoryMeter.revoke(iss, jti)`**: withdraws the grant so no new request
+  can reserve against the token; requests already in flight complete and are
+  committed as usual. Idempotent; `False` for an unknown `(iss, jti)`.
+- **`TokenRevoked(drained)`**: what `reserve()` returns for a revoked token.
+  `drained` is true once nothing is in flight on it.
+- **Final record only after the drain**: `consumed_record()` withholds a
+  revoked token's record while requests are in flight, so a record the
+  resource issues after the revocation is the token's final figure and the
+  issuer can settle on it (the ordering is checkable by `iat`).
+- **`make_revocation_endpoint(meter, authenticate_ps=…)`**: the base
+  protocol's endpoint — signed `POST {"iss","jti"}`, `200` empty on success or
+  already-invalid, `404` unknown, `403` when the caller is not the issuer.
+- **`BudgetMiddleware`** answers a revoked token with the plain
+  `requirement=auth-token` challenge (`code: AUTH_TOKEN_REVOKED`, no
+  `AAuth-Budget`), the resource token carrying the final record once drained.
+- `revocation_state(key, jti)` for resources that learn of revocation out of
+  band (e.g. from their own registry) and want the same challenge.
+
 ## 0.5.1
 
 **Budgets — the final-record challenge for expired auth tokens** (draft

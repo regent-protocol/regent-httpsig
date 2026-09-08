@@ -41,6 +41,7 @@ from regent_httpsig.budget import (
     InvalidBudgetClaim,
     MeterKey,
     Reservation,
+    TokenRevoked,
     UnitMismatch,
 )
 from regent_httpsig.sfv import build_aauth_budget_header, build_aauth_requirement
@@ -229,6 +230,11 @@ class BudgetMiddleware(BaseHTTPMiddleware):
                                  remaining=0, key=key)
 
         outcome = await self._meter.reserve(key, jti, int(max_cost))
+        if isinstance(outcome, TokenRevoked):
+            # §Token Scope: the budget ended with the token. The challenge is
+            # the base protocol's plain one; the resource token on it carries
+            # the token's FINAL record once nothing is in flight (AAuth #151).
+            return await self._revoked_challenge(key, jti, outcome.drained)
         if isinstance(outcome, InsufficientBudget):
             reason = "budget-exhausted" if outcome.exhausted else "insufficient-budget"
             return await self._refusal_with_token(
@@ -324,6 +330,27 @@ class BudgetMiddleware(BaseHTTPMiddleware):
         request.state.regent_httpsig_result = (
             None if result is not None and result.expired else result)
         return result
+
+    async def _revoked_challenge(self, key: MeterKey, jti: str, drained: bool) -> Response:
+        token: str | None = None
+        if self._resource_token is not None:
+            try:
+                record = await self._meter.consumed_record(key, jti) if drained else None
+                token = await _maybe_await(self._resource_token(key, record))
+            except Exception:  # noqa: BLE001 — the challenge must not fail on the extras
+                logger.warning("resource_token_provider failed", exc_info=True)
+        return JSONResponse(
+            status_code=401,
+            content={
+                "code": "AUTH_TOKEN_REVOKED",
+                "message": "This auth token was revoked by its issuer. Take the resource "
+                           "token in AAuth-Requirement to your PS for a fresh one."
+                           + ("" if drained else " Its final consumption record follows once "
+                              "in-flight requests settle."),
+            },
+            headers={"AAuth-Requirement": build_aauth_requirement(
+                reason=None, resource_token=token)},
+        )
 
     async def _expired_challenge(self, sig: VerifiedSignature) -> Response:
         jti = str(sig.claims.get("jti") or "")

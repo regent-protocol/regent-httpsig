@@ -144,6 +144,9 @@ production on [get4agent.com](https://get4agent.com).
 
 - `insufficient-budget` refusals carry **`required`** — the refused request's
   maximum cost — so the agent lowers its bound and retries instead of guessing.
+- **Revocation**: `make_revocation_endpoint(meter, authenticate_ps=…)` is the
+  base protocol's endpoint; a revoked token stops spending at once, in-flight
+  requests complete, and its final record rides on the next challenge.
 - An **expired** auth token gets the base protocol's plain challenge with a
   resource token carrying that token's **final** consumption record — the
   figure its issuer needs to settle the allocation (a record stated at or

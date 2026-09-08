@@ -9,6 +9,7 @@ from regent_httpsig.budget import (
     InMemoryMeter,
     InsufficientBudget,
     InvalidBudgetClaim,
+    TokenRevoked,
     UnitMismatch,
 )
 from regent_httpsig.config import HttpsigConfig
@@ -24,13 +25,14 @@ from regent_httpsig.usage import (
     ResponseSigner,
     UsageQueryError,
     build_usage_response,
+    make_revocation_endpoint,
     make_usage_endpoint,
     parse_usage_request,
     validate_budget_grant,
 )
 from regent_httpsig.verify import WBA_TAG, HttpsigVerifier, VerifiedSignature
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 __all__ = [
     "DIRECTORY_MEDIA_TYPE",
@@ -40,6 +42,7 @@ __all__ = [
     "HttpsigVerifier",
     "InMemoryMeter",
     "InsufficientBudget",
+    "TokenRevoked",
     "InvalidBudgetClaim",
     "NotPublicURL",
     "UnitMismatch",
@@ -51,6 +54,7 @@ __all__ = [
     "ResponseSigner",
     "UsageQueryError",
     "build_usage_response",
+    "make_revocation_endpoint",
     "make_usage_endpoint",
     "parse_usage_request",
     "validate_budget_grant",

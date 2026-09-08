@@ -28,7 +28,7 @@ from regent_httpsig import (
     build_aauth_requirement,
     generate_seed,
 )
-from regent_httpsig.budget import Reservation
+from regent_httpsig.budget import Reservation, TokenRevoked
 from regent_httpsig.fastapi import BudgetMiddleware
 from regent_httpsig.sfv import SFDictionary
 
@@ -569,3 +569,98 @@ async def test_plain_verify_still_rejects_expired_tokens(
     sig = await verifier.verify("POST", f"{RESOURCE}/v1/search", headers,
                                 allow_expired_auth_token=True)
     assert sig is not None and sig.expired
+
+
+# ── revocation (base protocol §Token Revocation · budgets §Token Scope · AAuth #151) ──
+
+async def test_meter_revoke_drains_before_final_record() -> None:
+    """Revocation stops new spend at once; a request already in flight completes;
+    the token's record is withheld until nothing is in flight, then it is final."""
+    meter = InMemoryMeter()
+    await meter.observe_grant(KEY, "jti-r", _claim(1000), time.time() + 600)
+    inflight = await meter.reserve(KEY, "jti-r", 300)
+    assert isinstance(inflight, Reservation)
+
+    assert await meter.revoke(KEY[0], "jti-r") is True
+    assert await meter.revoke(KEY[0], "jti-r") is True   # idempotent
+    assert await meter.revoke(KEY[0], "never-seen") is False
+
+    # No new spend, and the record is withheld while the in-flight request runs.
+    outcome = await meter.reserve(KEY, "jti-r", 1)
+    assert outcome == TokenRevoked(drained=False)
+    assert await meter.consumed_record(KEY, "jti-r") is None
+    # The in-flight request completes and is committed as usual.
+    await meter.commit(inflight, 250)
+    assert await meter.reserve(KEY, "jti-r", 1) == TokenRevoked(drained=True)
+    assert await meter.consumed_record(KEY, "jti-r") == {"jti": "jti-r", "consumed": 250}
+    assert await meter.revocation_state(KEY, "jti-r") == TokenRevoked(drained=True)
+    assert await meter.revocation_state(KEY, "other") is None
+    # A later observe_grant of the same jti does not resurrect the grant.
+    await meter.observe_grant(KEY, "jti-r", _claim(1000), time.time() + 600)
+    assert await meter.reserve(KEY, "jti-r", 1) == TokenRevoked(drained=True)
+
+
+def _revocation_app(meter: InMemoryMeter, caller: str | None) -> FastAPI:
+    from regent_httpsig import make_revocation_endpoint
+
+    async def auth(request: Any) -> str | None:
+        return caller
+
+    handler = make_revocation_endpoint(meter, authenticate_ps=auth)
+    app = FastAPI()
+
+    @app.post("/revoke")
+    async def revoke(request: Request):  # type: ignore[no-untyped-def]
+        return await handler(request)
+
+    return app
+
+
+async def test_revocation_endpoint_contract() -> None:
+    from starlette.testclient import TestClient
+
+    meter = InMemoryMeter()
+    await meter.observe_grant(KEY, "jti-e", _claim(500), time.time() + 600)
+    # Unauthenticated → 401, nothing revoked.
+    r = TestClient(_revocation_app(meter, None)).post(
+        "/revoke", json={"iss": PS_ISS, "jti": "jti-e"})
+    assert r.status_code == 401
+    assert isinstance(await meter.reserve(KEY, "jti-e", 1), Reservation)
+    client = TestClient(_revocation_app(meter, PS_ISS))
+    assert client.post("/revoke", json={"iss": PS_ISS}).status_code == 400       # jti REQUIRED
+    other = {"iss": "https://other.example", "jti": "jti-e"}
+    assert client.post("/revoke", json=other).status_code == 403
+    assert client.post("/revoke", json={"iss": PS_ISS, "jti": "ghost"}).status_code == 404
+    r = client.post("/revoke", json={"iss": PS_ISS, "jti": "jti-e"})
+    assert r.status_code == 200 and r.content == b""                            # empty on success
+    again = client.post("/revoke", json={"iss": PS_ISS, "jti": "jti-e"})
+    assert again.status_code == 200  # already invalid → still 200
+    assert isinstance(await meter.reserve(KEY, "jti-e", 1), TokenRevoked)
+
+
+async def test_middleware_revoked_token_gets_challenge_then_final_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ps_priv, ps_jwk = _ps_pair()
+    agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
+    token = _auth_token(ps_priv, agent, amount=1000, jti="at-rv")
+    calls: list[Any] = []
+
+    def provider(key: Any, record: Any) -> str:
+        calls.append(record)
+        return "resource.token.rv"
+
+    meter = InMemoryMeter()
+    app = _app(_verifier(ps_jwk, monkeypatch), meter=meter, resource_token_provider=provider)
+    first = await _post(app, "/v1/search", _signed_headers(agent, token, "/v1/search"))
+    assert first.status_code == 200
+
+    # The issuer revokes; the next request is refused with the plain challenge
+    # and, nothing being in flight, the FINAL record rides on it.
+    assert await meter.revoke(PS_ISS, "at-rv")
+    r = await _post(app, "/v1/search", _signed_headers(agent, token, "/v1/search"))
+    assert r.status_code == 401 and r.json()["code"] == "AUTH_TOKEN_REVOKED"
+    assert (r.headers["AAuth-Requirement"]
+            == 'requirement=auth-token;resource-token="resource.token.rv"')
+    assert "AAuth-Budget" not in r.headers
+    assert calls[-1] == {"jti": "at-rv", "consumed": 300}
