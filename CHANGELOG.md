@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.1
+
+- Ship the `py.typed` marker: the package has been mypy-strict since 0.1, and
+  without the marker a strict consumer sees `import-untyped` on every import.
+
 ## 0.7.0
 
 **AAuth -11 cut-over** (draft-hardt-oauth-aauth-protocol-11, published
