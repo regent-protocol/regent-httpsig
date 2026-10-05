@@ -192,6 +192,10 @@ class InMemoryMeter:
                  usage_key_retention: float = 86400.0) -> None:
         self._pools: dict[MeterKey, _Pool] = {}
         self._jti_index: dict[tuple[str, str], MeterKey] = {}  # (iss, jti) -> ledger key
+        # -11 §11.12.1: revocations keyed by (iss, jti), kept until the token's
+        # own exp plus clock skew — whether or not the token was ever seen here.
+        self._revocations: dict[tuple[str, str], float] = {}  # (iss, jti) -> exp (wall)
+        self._revocation_skew = 60.0
         self._lock = asyncio.Lock()
         self._rids = itertools.count(1)
         self._reservation_ttl = reservation_ttl
@@ -326,12 +330,51 @@ class InMemoryMeter:
             pool = self._purge(key, time.monotonic())
             return 0 if pool is None else self._remaining(pool, jti)
 
+    def _prune_revocations(self, wall: float) -> None:
+        for pair, exp in list(self._revocations.items()):
+            if wall > exp + self._revocation_skew:
+                del self._revocations[pair]
+
+    def _withdraw(self, iss: str, jti: str) -> bool:
+        """Withdraw a known token's grant (call under lock). ``False`` when the
+        pair was never granted here — the revocation is still on record."""
+        key = self._jti_index.get((iss, jti))
+        if key is None:
+            return False
+        pool = self._purge(key, time.monotonic())
+        if pool is None:
+            return False
+        pool.revoked.setdefault(jti, time.time())
+        pool.grants.pop(jti, None)
+        pool.last_activity = time.monotonic()
+        return True
+
+    async def record_revocation(self, iss: str, jti: str, exp: float) -> bool:
+        """Record that ``iss`` revoked ``jti`` (-11 §11.12.1): remembered until
+        ``exp`` plus clock skew whether or not the token was ever presented
+        here, so a later presentation is answered ``revoked_jwt``. If the token
+        holds a grant, it is withdrawn — no new request can reserve against it;
+        requests already in flight complete and are committed as usual.
+        Returns whether the token was known here. Idempotent."""
+        async with self._lock:
+            wall = time.time()
+            self._prune_revocations(wall)
+            if wall <= float(exp) + self._revocation_skew:  # §11.12.1: past exp + skew is droppable
+                self._revocations[(iss, jti)] = float(exp)
+            return self._withdraw(iss, jti)
+
+    async def is_revoked(self, iss: str, jti: str) -> bool:
+        """Whether ``(iss, jti)`` is on record as revoked — the hook for
+        :class:`HttpsigVerifier` (``is_revoked=meter.is_revoked``)."""
+        async with self._lock:
+            self._prune_revocations(time.time())
+            return (iss, jti) in self._revocations
+
     async def revoke(self, iss: str, jti: str) -> bool:
-        """Revoke an auth token by ``(iss, jti)`` — the base protocol's
-        revocation identifier. The grant is withdrawn so no new request can
-        reserve against it; requests already in flight complete and are
-        committed as usual. ``False`` when the pair is unknown here (the
-        endpoint answers 404). Idempotent."""
+        """Revoke a token this meter holds a grant for, by ``(iss, jti)``. Like
+        :meth:`record_revocation` with the grant's own ``exp``; ``False`` when
+        the pair is unknown here (nothing is recorded then — use
+        :meth:`record_revocation` when the issuer told you the exp)."""
         async with self._lock:
             key = self._jti_index.get((iss, jti))
             if key is None:
@@ -339,10 +382,11 @@ class InMemoryMeter:
             pool = self._purge(key, time.monotonic())
             if pool is None:
                 return False
-            pool.revoked.setdefault(jti, time.time())
-            pool.grants.pop(jti, None)
-            pool.last_activity = time.monotonic()
-            return True
+            grant = pool.grants.get(jti)
+            wall = time.time()
+            exp = wall + max(0.0, grant[1] - time.monotonic()) if grant else wall
+            self._revocations[(iss, jti)] = max(self._revocations.get((iss, jti), 0.0), exp)
+            return self._withdraw(iss, jti)
 
     async def revocation_state(self, key: MeterKey, jti: str) -> TokenRevoked | None:
         """``TokenRevoked`` (with its drain state) if the token was revoked

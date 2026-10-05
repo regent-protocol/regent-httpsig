@@ -34,3 +34,25 @@ def test_sign_emits_wba_headers_and_preserves_input() -> None:
     assert "Signature-Input" in headers and "Signature" in headers
     assert 'tag="web-bot-auth"' in headers["Signature-Input"]
     assert headers["Content-Type"] == "application/json"  # original headers intact
+
+
+def test_public_jwk_is_fully_specified_and_directory_is_wba() -> None:
+    """AAuth -11 wants `alg: Ed25519` on cnf.jwk (RFC 9864); the Web Bot Auth
+    directory keeps the profile's own `EdDSA` — two profiles, two documents."""
+    signer = EgressSigner(seed=generate_seed(), signature_agent="https://a.example")
+    assert signer.public_jwk["alg"] == "Ed25519"
+    assert signer.directory()["keys"][0]["alg"] == "EdDSA"
+    assert jwk_thumbprint(signer.public_jwk) == signer.keyid  # alg never enters the thumbprint
+
+
+def test_sign_aauth_shape() -> None:
+    signer = EgressSigner(seed=generate_seed(), signature_agent="https://a.example")
+    headers = signer.sign_aauth("POST", "https://api.example/v1/x", token="a.b.c", body=b"{}")
+    assert headers["Signature-Key"] == 'sig=jwt;jwt="a.b.c"'
+    assert headers["Content-Digest"].startswith("sha-256=:")
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Signature-Input"].startswith(
+        'sig=("@method" "@authority" "@path" "signature-key" "content-digest" '
+        '"content-type");created=')
+    assert "keyid" not in headers["Signature-Input"] and "alg=" not in headers["Signature-Input"]
+

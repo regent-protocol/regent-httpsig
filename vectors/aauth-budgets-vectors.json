@@ -113,7 +113,7 @@
       "Content-Digest": "sha-256=:Jj+8+vDgDSFJryQMnASY9O2TEznYDi1lsJ/+DRo7s14=:",
       "Signature-Input": "sig=(\"@status\" \"content-type\" \"content-digest\" \"@authority\";req \"@path\";req);created=1756500001",
       "Signature": "sig=:tPyxKUn/9Grz7cMH0k6RIKjoy78KuoqkrMUZsocLi1UtWxFgqyKo0yANnu4TBlZm6593A9BzgoaUrv7mgFtUCA==:",
-      "Signature-Key": "sig=jwks_uri; jwks_uri=\"https://api.example/jwks.json\""
+      "Signature-Key": "sig=jwks_uri;id=\"https://api.example\";dwk=\"aauth-resource.json\";kid=\"1IG2tMH7J2wbJZnOf8LJzQitKf7LMvoAElsuDMVM54Y\""
     }
   }
 }

@@ -10,23 +10,35 @@ Two schemes are accepted side by side (both ride the same ``Signature`` /
   traffic this way today. Both wire forms of ``Signature-Agent`` are accepted:
   the draft -05 sf-dictionary (covered with ``;key=``) and the legacy bare
   sf-string OpenAI ships.
-- **AAuth** (draft-hardt-oauth-aauth-protocol, identity-based mode): the agent
-  carries a JWT ``agent_token`` (``typ: aa-agent+jwt``) in the ``Signature-Key``
-  header; the token's issuer JWKS (``{iss}/.well-known/aauth-agent.json`` →
-  ``jwks_uri``) verifies the token, and the token's ``cnf.jwk`` verifies the
-  request signature (proof of possession). Requires the ``[aauth]`` extra.
+- **AAuth** (draft-hardt-oauth-aauth-protocol-11): the agent carries a JWT in
+  the ``Signature-Key`` header under the ``jwt`` scheme — an agent token
+  (``typ: aa-agent+jwt``), a person token (``aa-person+jwt``) or an auth token
+  (``aa-auth+jwt``, the budget carrier). The issuer's JWKS, discovered through
+  ``{iss}/.well-known/{dwk}``, verifies the token; the token's ``cnf.jwk``
+  verifies the request signature (proof of possession). Servers (a PS or AS
+  calling a resource's usage or revocation endpoint) sign under the ``jwks_uri``
+  scheme with ``id``, ``dwk`` and ``kid``. Requires the ``[aauth]`` extra.
+
+Failures are typed, not silent: :meth:`HttpsigVerifier.verify_detailed` returns
+a :class:`VerificationError` carrying the ``Signature-Error`` code of
+draft-hardt-httpbis-signature-key (``invalid_signature``, ``clock_skew``,
+``expired_jwt``, ``revoked_jwt``, ``unsupported_scheme``, …) exactly as -11
+§11.3.4 assigns them, so a resource can answer ``401`` with the header the
+agent needs. :meth:`HttpsigVerifier.verify` keeps the old ``None``-on-failure
+contract for callers that only want a yes or no.
 
 Directory fetches are SSRF-guarded (https-only, public-IP-only, size-capped,
-no redirects) and cached per verifier instance. A bad or missing signature
-yields ``None`` — verification failure is a result, not an exception.
+no redirects) and cached per verifier instance.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -45,10 +57,18 @@ from regent_httpsig.sfv import (
     Message,
     StaticKeyResolver,
     parse_signature_agent,
-    parse_signature_key_header,
+    parse_signature_input,
+    parse_signature_key,
 )
 
-__all__ = ["HttpsigVerifier", "VerifiedSignature", "WBA_TAG"]
+__all__ = [
+    "AAUTH_ACCEPT_ALGS",
+    "AAUTH_ACCEPT_SCHEMES",
+    "HttpsigVerifier",
+    "VerificationError",
+    "VerifiedSignature",
+    "WBA_TAG",
+]
 
 logger = logging.getLogger("regent_httpsig")
 
@@ -58,13 +78,23 @@ AAUTH_METADATA_PATH = "/.well-known/aauth-agent.json"
 AAUTH_PERSON_METADATA_PATH = "/.well-known/aauth-person.json"
 AAUTH_JWT_TYP = "aa-agent+jwt"
 AAUTH_PERSON_TYP = "aa-person+jwt"
-AAUTH_AUTH_TYP = "aa-auth+jwt"  # PS-issued auth tokens — the budget carrier
-# -11: person and auth tokens live at most one hour — enforced with tolerance.
-PERSON_TOKEN_MAX_LIFETIME = 3600 + 90
-# How long after its exp an auth token still earns the budgets "final record"
-# challenge (opt-in, BudgetMiddleware only): the meter retains consumption for
-# about this long after last activity; beyond it there is no figure to carry.
-EXPIRED_AUTH_TOKEN_GRACE = 7200
+AAUTH_AUTH_TYP = "aa-auth+jwt"  # PS/AS-issued auth tokens — the budget carrier
+# The well-known documents a server may sign under (§11.3.2).
+SERVER_DWKS = ("aauth-person.json", "aauth-access.json", "aauth-agent.json", "aauth-resource.json")
+# -11 §11.5.2: person and auth tokens live at most one hour. No tolerance.
+PERSON_TOKEN_MAX_LIFETIME = 3600
+# What this verifier accepts, as advertised on Signature-Error responses.
+AAUTH_ACCEPT_SCHEMES: tuple[str, ...] = ("jwt", "jwks_uri")
+AAUTH_ACCEPT_ALGS: tuple[str, ...] = ("Ed25519", "ES256", "RS256")
+
+# JOSE alg → (RFC 9421 signature algorithm, key type, curve)
+_ALG_TABLE: dict[str, tuple[str, str, str | None]] = {
+    "Ed25519": ("ED25519", "OKP", "Ed25519"),
+    "ES256": ("ECDSA_P256_SHA256", "EC", "P-256"),
+    "RS256": ("RSA_V1_5_SHA256", "RSA", None),
+}
+
+RevocationCheck = Callable[[str, str], Awaitable[bool]]
 
 
 def _register_fully_specified_algs() -> None:
@@ -81,20 +111,15 @@ def _register_fully_specified_algs() -> None:
 
 @dataclass
 class VerifiedSignature:
-    """A successfully verified inbound agent signature."""
+    """A successfully verified inbound signature."""
 
-    scheme: str  # "web-bot-auth" | "aauth"
-    agent: str  # WBA: Signature-Agent origin; AAuth: the token issuer
-    keyid: str  # RFC 7638 / RFC 8037 A.3 JWK thumbprint
+    scheme: str  # "web-bot-auth" | "aauth" | "aauth-person" | "aauth-auth" | "aauth-server"
+    agent: str  # WBA: Signature-Agent origin; AAuth: the token issuer / the server id
+    keyid: str  # RFC 7638 / RFC 8037 A.3 JWK thumbprint (server scheme: the JWKS kid)
     trusted: bool  # agent/issuer is on the configured trust list
     sub: str | None = None  # AAuth agent id (token `sub`)
     label: str = ""
     claims: dict[str, Any] = field(default_factory=dict)  # AAuth token claims (redacted)
-    # Set only when ``verify(..., allow_expired_auth_token=True)`` accepted an
-    # auth token PAST its exp: genuine (issuer signature + proof of possession
-    # verified) but NOT valid for access. BudgetMiddleware uses it to answer
-    # with the final-record challenge; nothing else should ever see it True.
-    expired: bool = False
 
     def context(self) -> dict[str, Any]:
         """A flat dict suitable for logging / policy engines / audit trails."""
@@ -110,11 +135,46 @@ class VerifiedSignature:
         return out
 
 
+@dataclass
+class VerificationError:
+    """Why a signed request was refused — the ``Signature-Error`` vocabulary of
+    draft-hardt-httpbis-signature-key, assigned as AAuth -11 §11.3.4 assigns it.
+    ``headers()`` is what a 401 carries; ``problem()`` is the RFC 9457 body."""
+
+    code: str
+    detail: str = ""
+    accept_schemes: tuple[str, ...] = ()
+    accept_algs: tuple[str, ...] = ()
+    required_input: tuple[str, ...] = ()
+    token_typ: str | None = None  # the AAuth token typ, once known (jwt scheme only)
+
+    def headers(self) -> dict[str, str]:
+        value = f"error={self.code}"
+        if self.required_input:
+            inner = " ".join(f'"{c}"' for c in self.required_input)
+            value += f", required_input=({inner})"
+        out = {"Signature-Error": value}
+        if self.accept_schemes:
+            out["Accept-Signature-Scheme"] = ", ".join(self.accept_schemes)
+        if self.accept_algs:
+            out["Accept-Signature-Alg"] = ", ".join(self.accept_algs)
+        return out
+
+    def problem(self, status: int = 401) -> dict[str, Any]:
+        return {
+            "type": f"urn:ietf:params:sig-error:{self.code}",
+            "title": self.code.replace("_", " "),
+            "status": status,
+            "detail": self.detail or self.code,
+            "error": self.code,
+        }
+
+
 class _KeyidOptionalParams(dict):  # type: ignore[type-arg]
     """RFC 9421 makes ``keyid`` OPTIONAL, but the upstream verifier reads
     ``params["keyid"]`` unconditionally. On the AAuth path the key comes from
-    the token's ``cnf.jwk``, so conforming signers (e.g. aauth-signing) omit
-    keyid entirely. Returning None for a missing keyid routes resolution to our
+    the Signature-Key header, so conforming signers omit keyid (§11.3.3.2).
+    Returning None for a missing keyid routes resolution to our
     StaticKeyResolver default WITHOUT adding the key to the params — iteration
     is unchanged, so the reconstructed signature base stays byte-identical."""
 
@@ -125,6 +185,11 @@ class _KeyidOptionalParams(dict):  # type: ignore[type-arg]
 
 
 class _KeyidOptionalVerifier(HTTPMessageVerifier):
+    def validate_created_and_expires(self, sig_input: Any, max_age: Any = None) -> None:
+        """No-op: the -11 window (`created` ± signature_window, `expires`) was
+        judged in ``_check_signature_input`` with the draft's own error codes;
+        the upstream 5-second skew rule must not pre-empt them."""
+
     def _verify_one(self, *, label: Any, sig_input: Any, signature: Any,
                     message: Any, max_age: Any) -> Any:
         if "keyid" not in sig_input.params:
@@ -145,12 +210,51 @@ def _keys_from_jwks(doc: dict[str, Any]) -> dict[str, Ed25519PublicKey]:
     return keys
 
 
+class _Refused(Exception):
+    """Internal: carries a VerificationError out of the AAuth path."""
+
+    def __init__(self, error: VerificationError) -> None:
+        super().__init__(error.code)
+        self.error = error
+
+
+def _refuse(code: str, detail: str = "", **extra: Any) -> _Refused:
+    return _Refused(VerificationError(code, detail, **extra))
+
+
+def _load_public_key(jwk: dict[str, Any]) -> tuple[Any, Any]:
+    """Return ``(public key object, http_message_signatures algorithm)`` for a JWK
+    whose ``alg`` is fully specified. Raises _Refused with the -11 code."""
+    from http_message_signatures import algorithms as hms_algs
+
+    alg = jwk.get("alg")
+    if not isinstance(alg, str) or alg not in _ALG_TABLE:
+        raise _refuse("unsupported_algorithm",
+                      f"key alg {alg!r} is absent, polymorphic or not implemented",
+                      accept_algs=AAUTH_ACCEPT_ALGS)
+    hms_name, kty, crv = _ALG_TABLE[alg]
+    if jwk.get("kty") != kty or (crv is not None and jwk.get("crv") != crv):
+        raise _refuse("invalid_key", f"key type disagrees with alg {alg}")
+    try:
+        if alg == "Ed25519":
+            key: Any = load_ed25519_jwk(jwk)
+        else:
+            import jwt as pyjwt
+
+            key = pyjwt.PyJWK({k: v for k, v in jwk.items() if k != "alg"}).key
+    except Exception as exc:  # noqa: BLE001
+        raise _refuse("invalid_key", f"cannot parse key: {str(exc)[:80]}") from exc
+    return key, getattr(hms_algs, hms_name)
+
+
 class HttpsigVerifier:
     """Verify RFC 9421-signed agent requests (Web Bot Auth + AAuth).
 
     Instances are cheap and hold their own directory cache; create one per
     application and reuse it. ``http_client`` is optional — pass your app's
-    shared :class:`httpx.AsyncClient` to reuse its pool.
+    shared :class:`httpx.AsyncClient` to reuse its pool. ``is_revoked(iss,
+    jti)`` is how the application tells the verifier about revocations it has
+    received (§11.12.5): a token it says yes for is answered ``revoked_jwt``.
 
     Usage::
 
@@ -165,47 +269,82 @@ class HttpsigVerifier:
         config: HttpsigConfig | None = None,
         *,
         http_client: httpx.AsyncClient | None = None,
+        is_revoked: RevocationCheck | None = None,
     ) -> None:
         self.config = config or HttpsigConfig()
         self._http = http_client
         self._owns_client = http_client is None
+        self._is_revoked = is_revoked
         # url -> (expires_monotonic, parsed JSON | None for negative entries)
         self._cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
     async def verify(
         self, method: str, url: str, headers: Mapping[str, str],
-        *, allow_expired_auth_token: bool = False,
+        body: bytes | None = None,
     ) -> VerifiedSignature | None:
-        """Verify the request's agent signature. Returns ``None`` when there is
-        no ``Signature`` header, the signature is invalid, or the signer's keys
-        cannot be (safely) fetched — never raises on untrusted input.
+        """Verify the request's signature. ``None`` when there is no ``Signature``
+        header, the signature is invalid, or the signer's keys cannot be (safely)
+        fetched — never raises on untrusted input. Use :meth:`verify_detailed`
+        to learn why."""
+        result = await self.verify_detailed(method, url, headers, body)
+        return result if isinstance(result, VerifiedSignature) else None
 
-        ``allow_expired_auth_token`` (default False — leave it so for access
-        decisions) lets a genuine ``aa-auth+jwt`` past its ``exp`` come back
-        with ``expired=True`` instead of ``None``, for up to
-        :data:`EXPIRED_AUTH_TOKEN_GRACE` seconds. Budgets need this: the
-        resource owes the holder of an expired token a challenge carrying that
-        token's final consumption record (draft §Budget Exhaustion), and it
-        cannot build one for a token it refused to look at."""
+    async def verify_detailed(
+        self, method: str, url: str, headers: Mapping[str, str],
+        body: bytes | None = None,
+    ) -> VerifiedSignature | VerificationError | None:
+        """Like :meth:`verify`, but a failure comes back as a
+        :class:`VerificationError` (``None`` only when no ``Signature`` header is
+        present at all). ``body`` enables the -11 body-coverage rule: when
+        given and non-empty, ``content-digest`` and ``content-type`` must be
+        covered and the digest must match."""
         hdrs = {str(k): str(v) for k, v in headers.items()}
         if not any(k.lower() == "signature" for k in hdrs):
             return None
-        result: VerifiedSignature | None = None
         try:
             if any(k.lower() == "signature-key" for k in hdrs):
-                result = await self._verify_aauth(
-                    method, url, hdrs, allow_expired_auth_token=allow_expired_auth_token)
+                return await self._verify_signature_key(method, url, hdrs, body)
+            result = await self._verify_web_bot_auth(method, url, hdrs)
             if result is None:
-                result = await self._verify_web_bot_auth(method, url, hdrs)
+                return VerificationError("invalid_signature",
+                                         "Web Bot Auth signature did not verify")
+            logger.info("httpsig verified scheme=%s agent=%s keyid=%s trusted=%s",
+                        result.scheme, result.agent, result.keyid[:16], result.trusted)
+            return result
+        except _Refused as exc:
+            logger.info("httpsig refused: %s %s", exc.error.code, exc.error.detail[:160])
+            return exc.error
         except Exception as exc:  # noqa: BLE001 — belt and braces
             logger.warning("httpsig verify error: %s", str(exc)[:200])
-            return None
-        if result is not None:
-            logger.info(
-                "httpsig verified scheme=%s agent=%s keyid=%s trusted=%s",
-                result.scheme, result.agent, result.keyid[:16], result.trusted,
-            )
-        return result
+            return VerificationError("invalid_signature", "verifier error")
+
+    async def verify_server(
+        self, method: str, url: str, headers: Mapping[str, str],
+        body: bytes | None = None, *, allowed_dwk: tuple[str, ...] = SERVER_DWKS,
+    ) -> VerifiedSignature | VerificationError:
+        """Verify a request a *server* signed under the ``jwks_uri`` scheme
+        (§11.3.2): a PS or AS at a revocation or usage endpoint. The caller is
+        identified by ``id``; ``trusted`` says whether it is a configured PS."""
+        hdrs = {str(k): str(v) for k, v in headers.items()}
+        try:
+            members = parse_signature_key(_header(hdrs, "signature-key"))
+            if not members:
+                raise _refuse("invalid_signature", "Signature-Key header missing or malformed")
+            label, scheme, params = members[0]
+            if scheme != "jwks_uri":
+                raise _refuse("unsupported_scheme",
+                              f"scheme {scheme!r}; servers sign under jwks_uri",
+                              accept_schemes=("jwks_uri",))
+            dwk = str(params.get("dwk") or "")
+            if dwk not in allowed_dwk:
+                raise _refuse("invalid_key", f"dwk {dwk!r} is not accepted here")
+            return await self._verify_server_scheme(method, url, hdrs, body, label, params)
+        except _Refused as exc:
+            logger.info("httpsig server refused: %s %s", exc.error.code, exc.error.detail[:160])
+            return exc.error
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("httpsig server verify error: %s", str(exc)[:200])
+            return VerificationError("invalid_signature", "verifier error")
 
     async def aclose(self) -> None:
         if self._owns_client and self._http is not None:
@@ -225,6 +364,9 @@ class HttpsigVerifier:
             # Evict the soonest-to-expire entry; bounds memory against keyid spam.
             self._cache.pop(min(self._cache, key=lambda k: self._cache[k][0]), None)
         self._cache[url] = (time.monotonic() + ttl, doc)
+
+    def _cache_forget(self, url: str) -> None:
+        self._cache.pop(url, None)
 
     async def _fetch_json(self, url: str) -> dict[str, Any] | None:
         """Fetch an attacker-nameable identity document safely: https-only
@@ -258,6 +400,42 @@ class HttpsigVerifier:
             return None
         self._cache_put(url, doc, cfg.cache_ttl)
         return doc
+
+    async def _jwks_key(self, jwks_url: str, kid: str | None) -> dict[str, Any]:
+        """The JWK with ``kid`` from the JWKS at ``jwks_url``; on an unknown kid the
+        document is refetched once (key rotation, §11.4). A JWKS of exactly one
+        key serves a header that names no kid."""
+        for attempt in (0, 1):
+            jwks = await self._fetch_json(jwks_url)
+            keys = list((jwks or {}).get("keys") or [])[:10]
+            if kid is None and len(keys) == 1 and isinstance(keys[0], dict):
+                return keys[0]
+            for k in keys:
+                if isinstance(k, dict) and k.get("kid") == kid:
+                    return k
+            if attempt == 0:
+                self._cache_forget(jwks_url)
+        raise _refuse("unknown_key", f"kid {kid!r} is not in the issuer's JWKS")
+
+    async def _issuer_jwks_url(self, iss: str, dwk: str, *, override: str | None = None) -> str:
+        """Resolve ``{iss}/.well-known/{dwk}`` to its ``jwks_uri`` (§11.4), checking
+        the document's ``issuer`` against ``iss`` (issuer_missing / issuer_mismatch)."""
+        if override:
+            return override
+        metadata = await self._fetch_json(iss.rstrip("/") + "/.well-known/" + dwk)
+        if not metadata:
+            raise _refuse("issuer_missing",
+                          f"metadata at {iss}/.well-known/{dwk} is unavailable")
+        issuer = metadata.get("issuer")
+        if not isinstance(issuer, str) or not issuer:
+            raise _refuse("issuer_missing", "metadata document has no issuer")
+        if issuer != iss:
+            raise _refuse("issuer_mismatch",
+                          "metadata issuer differs from the identity it was fetched under")
+        jwks_url = metadata.get("jwks_uri")
+        if not isinstance(jwks_url, str) or not jwks_url:
+            raise _refuse("issuer_missing", "metadata document has no jwks_uri")
+        return jwks_url
 
     # ── Web Bot Auth ─────────────────────────────────────────────────────────
 
@@ -304,187 +482,263 @@ class HttpsigVerifier:
             label=str(res.label),
         )
 
-    # ── AAuth (identity-based mode) ──────────────────────────────────────────
+    # ── AAuth: the Signature-Key header (§11.3) ──────────────────────────────
 
-    async def _verify_aauth(
-        self, method: str, url: str, headers: dict[str, str],
-        *, allow_expired_auth_token: bool = False,
-    ) -> VerifiedSignature | None:
+    async def _verify_signature_key(
+        self, method: str, url: str, headers: dict[str, str], body: bytes | None,
+    ) -> VerifiedSignature:
+        members = parse_signature_key(_header(headers, "signature-key"))
+        if not members:
+            raise _refuse("invalid_signature", "Signature-Key header is malformed")
+        label, scheme, params = members[0]
+        if scheme == "jwt":
+            return await self._verify_jwt_scheme(method, url, headers, body, label, params)
+        if scheme == "jwks_uri":
+            return await self._verify_server_scheme(method, url, headers, body, label, params)
+        raise _refuse("unsupported_scheme", f"scheme {scheme!r} is not accepted",
+                      accept_schemes=AAUTH_ACCEPT_SCHEMES)
+
+    def _check_signature_input(
+        self, headers: dict[str, str], label: str, body: bytes | None,
+    ) -> None:
+        """§11.3.3.1 covered components, §11.3.4 step 3 `created` window, `expires`."""
+        inputs = parse_signature_input(_header(headers, "signature-input"))
+        if label not in inputs:
+            raise _refuse("invalid_signature", f"Signature-Input has no member {label!r}")
+        covered, params = inputs[label]
+        required = list(self.config.required_components)
+        has_body = bool(body) or bool(_header(headers, "content-digest"))
+        if has_body:
+            required += ["content-digest", "content-type"]
+        missing = [c for c in required if c not in covered]
+        if missing:
+            raise _refuse("invalid_input", f"signature does not cover {', '.join(missing)}",
+                          required_input=tuple(required))
+        now = int(time.time())
+        window = int(self.config.signature_window_seconds)
+        created = params.get("created")
+        if not isinstance(created, int):
+            raise _refuse("invalid_signature", "created parameter is required")
+        if created > now + window:
+            raise _refuse("clock_skew", "signature created ahead of the server's clock")
+        if created < now - window:
+            raise _refuse("invalid_signature", "signature created outside the validity window")
+        expires = params.get("expires")
+        if isinstance(expires, int) and expires < now:
+            raise _refuse("invalid_signature", "signature has expired")
+        if body:
+            digest = _header(headers, "content-digest")
+            expected = "sha-256=:" + base64.b64encode(hashlib.sha256(body).digest()).decode() + ":"
+            if digest.replace(" ", "") != expected:
+                raise _refuse("invalid_signature", "Content-Digest does not match the body")
+
+    async def _verify_pop(
+        self, method: str, url: str, headers: dict[str, str], label: str,
+        key: Any, algorithm: Any, detail: str,
+    ) -> None:
+        """Verify the HTTP Message Signature labelled ``label`` with ``key``."""
+        message = Message(method, url, headers)
+        verifier = _KeyidOptionalVerifier(
+            signature_algorithm=algorithm,
+            key_resolver=StaticKeyResolver({}, default=key),
+            component_resolver_class=DictKeyComponentResolver,
+        )
+        try:
+            # created/expires were judged above against the -11 window; the
+            # library's own max_age is set wide so it cannot pre-empt our codes.
+            results = await asyncio.to_thread(
+                verifier.verify, message, max_age=timedelta(days=365),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise _refuse("invalid_signature", f"{detail}: {str(exc)[:120]}") from exc
+        if not any(str(r.label) == label for r in results):
+            raise _refuse("invalid_signature", f"no verified signature labelled {label!r}")
+
+    async def _verify_jwt_scheme(
+        self, method: str, url: str, headers: dict[str, str], body: bytes | None,
+        label: str, params: dict[str, Any],
+    ) -> VerifiedSignature:
         try:
             import jwt as pyjwt  # the [aauth] extra
-        except ImportError:
-            logger.info("Signature-Key present but pyjwt is not installed "
-                        "(pip install 'regent-httpsig[aauth]')")
-            return None
-
-        message = Message(method, url, headers)
-        parsed = parse_signature_key_header(message.headers.get("signature-key", ""))
-        if not parsed:
-            return None
-        label, token = parsed
-
+        except ImportError as exc:
+            raise _refuse("unsupported_scheme",
+                          "pyjwt is not installed (pip install 'regent-httpsig[aauth]')",
+                          accept_schemes=("jwks_uri",)) from exc
+        token = str(params.get("jwt") or "")
+        if not token:
+            raise _refuse("invalid_jwt", "jwt parameter is empty")
+        self._check_signature_input(headers, label, body)
         _register_fully_specified_algs()
         try:
             header = pyjwt.get_unverified_header(token)
             unverified = pyjwt.decode(token, options={"verify_signature": False})
-        except Exception:  # noqa: BLE001
-            return None
-        if header.get("alg") in (None, "none"):
-            return None
+        except Exception as exc:  # noqa: BLE001
+            raise _refuse("invalid_jwt", "token is malformed") from exc
 
-        # -11 token-type dispatch: agent tokens (identity mode), person tokens
-        # (PS-issued, per-resource, opt-in via config.resource_url) and auth
-        # tokens (PS-issued budget carriers, opt-in via config.trusted_ps).
         typ = header.get("typ")
+        try:
+            return await self._verify_jwt_token(method, url, headers, label, token,
+                                                header, unverified, typ)
+        except _Refused as exc:
+            exc.error.token_typ = typ if isinstance(typ, str) else None
+            raise
+
+    async def _verify_jwt_token(
+        self, method: str, url: str, headers: dict[str, str], label: str,
+        token: str, header: dict[str, Any], unverified: dict[str, Any], typ: Any,
+    ) -> VerifiedSignature:
+        import jwt as pyjwt
+
+        # §11.5.2 step 1: typ first.
+        cfg = self.config
         jwks_override: str | None = None
+        expected_dwks: tuple[str, ...]
+        audience: str | None = None
         if typ == AAUTH_JWT_TYP:
-            scheme, expected_dwk = "aauth", "aauth-agent.json"
-            metadata_path, audience = AAUTH_METADATA_PATH, None
+            scheme, expected_dwks = "aauth", ("aauth-agent.json",)
         elif typ == AAUTH_PERSON_TYP:
-            if not self.config.resource_url:
-                logger.info("person token presented but config.resource_url is not "
-                            "set — person-token verification is disabled")
-                return None
-            scheme, expected_dwk = "aauth-person", "aauth-person.json"
-            metadata_path, audience = AAUTH_PERSON_METADATA_PATH, self.config.resource_url
+            if not cfg.resource_url:
+                raise _refuse("invalid_key",
+                              "person tokens are not accepted here (resource_url unset)")
+            scheme, expected_dwks = "aauth-person", ("aauth-person.json",)
+            audience = cfg.resource_url
         elif typ == AAUTH_AUTH_TYP:
-            if not self.config.resource_url or not self.config.trusted_ps:
-                logger.info("auth token presented but resource_url/trusted_ps is not "
-                            "configured — auth-token verification is disabled")
-                return None
-            scheme, expected_dwk = "aauth-auth", None
-            metadata_path, audience = None, self.config.resource_url
+            if not cfg.resource_url or not cfg.trusted_ps:
+                raise _refuse("invalid_key",
+                              "auth tokens are not accepted here (resource_url/trusted_ps unset)")
+            scheme, expected_dwks = "aauth-auth", ("aauth-person.json", "aauth-access.json")
+            audience = cfg.resource_url
         else:
-            return None
+            raise _refuse("invalid_jwt", f"typ {typ!r} is not an AAuth token type")
 
-        iss = str(unverified.get("iss", ""))
+        alg = header.get("alg")
+        allowed = list(AAUTH_ACCEPT_ALGS)
+        if not cfg.require_fully_specified_algs:
+            allowed.append("EdDSA")
+        if alg not in allowed:
+            raise _refuse("unsupported_algorithm", f"token alg {alg!r}",
+                          accept_algs=AAUTH_ACCEPT_ALGS)
+
+        iss = str(unverified.get("iss") or "")
+        dwk = str(unverified.get("dwk") or "")
+        dev = bool(iss) and urlsplit(iss).hostname in cfg.insecure_hosts
+        if not iss or (not iss.startswith("https://") and not dev):
+            raise _refuse("invalid_jwt", "iss is not an https server identifier")
+        if dwk not in expected_dwks:
+            raise _refuse("invalid_jwt", f"dwk {dwk!r} is not {' or '.join(expected_dwks)}")
         if typ == AAUTH_AUTH_TYP:
-            # The resource pins its PS: issuer must be explicitly trusted and its
-            # JWKS location comes from configuration, not open-world discovery.
-            override = self.config.trusted_ps.get(iss)
+            # The resource pins its PS/AS: the issuer must be configured.
+            override = cfg.trusted_ps.get(iss)
             if override is None:
-                logger.info("auth token issuer %s is not a configured PS", iss[:100])
-                return None
-            jwks_override = override
-        else:
-            bad_iss = (unverified.get("dwk") != expected_dwk
-                       or not iss.startswith("https://"))
-            if bad_iss and not (
-                iss and urlsplit(iss).hostname in self.config.insecure_hosts  # dev escape
-            ):
-                return None
+                raise _refuse("invalid_key", f"issuer {iss} is not a configured PS/AS")
+            jwks_override = override or None
 
-        # AAuth -11 / RFC 9864: fully-specified algorithms. "EdDSA" (polymorphic)
-        # is accepted only while require_fully_specified_algs is False — a
-        # transition affordance for the -10 ecosystem.
-        allowed_algs = ["Ed25519", "ES256", "RS256"]
-        if not self.config.require_fully_specified_algs:
-            allowed_algs.append("EdDSA")
+        # 1) The issuer's key, discovered through its metadata (or the pinned URL).
+        jwks_url = await self._issuer_jwks_url(iss, dwk, override=jwks_override)
+        issuer_jwk = await self._jwks_key(jwks_url, header.get("kid"))
+        key_alg = issuer_jwk.get("alg")
+        if cfg.require_fully_specified_algs and key_alg != alg:
+            raise _refuse("unsupported_algorithm", f"issuer key alg {key_alg!r} is not {alg}",
+                          accept_algs=AAUTH_ACCEPT_ALGS)
+        try:
+            if key_alg in (None, "EdDSA") or alg == "Ed25519":
+                issuer_key: Any = load_ed25519_jwk(issuer_jwk)
+            else:
+                issuer_key = pyjwt.PyJWK({k: v for k, v in issuer_jwk.items() if k != "alg"}).key
+        except Exception as exc:  # noqa: BLE001
+            raise _refuse("invalid_key", "issuer key cannot be parsed") from exc
 
-        # 1) Verify the token against the issuer's published JWKS.
-        if jwks_override is not None:
-            jwks = await self._fetch_json(jwks_override)
-        else:
-            metadata = await self._fetch_json(iss.rstrip("/") + str(metadata_path))
-            if not metadata or not metadata.get("jwks_uri"):
-                return None
-            jwks = await self._fetch_json(str(metadata["jwks_uri"]))
-        if not jwks:
-            return None
-        issuer_key = None
-        for k in list(jwks.get("keys") or [])[:10]:
-            if k.get("kid") == header.get("kid") or len(jwks.get("keys") or []) == 1:
-                try:
-                    issuer_key = pyjwt.PyJWK(k).key
-                    break
-                except Exception:  # noqa: BLE001
-                    # PyJWK's internal registry predates RFC 9864 names — a JWKS
-                    # advertising alg "Ed25519" is valid in -11 but unknown to it.
-                    try:
-                        issuer_key = load_ed25519_jwk(k)
-                        break
-                    except ValueError:
-                        continue
-        if issuer_key is None:
-            return None
-        tolerate_exp = allow_expired_auth_token and typ == AAUTH_AUTH_TYP
+        # 2) The token itself: signature, exp with no tolerance, iat bound by the window.
         try:
             claims = pyjwt.decode(
-                token,
-                key=issuer_key,
-                algorithms=allowed_algs,
-                audience=audience,
-                options={
-                    "require": ["iss", "sub", "exp", "iat"],
-                    "verify_aud": audience is not None,
-                    "verify_exp": not tolerate_exp,
-                },
+                token, key=issuer_key, algorithms=[alg], audience=audience,
+                options={"require": ["iss", "sub", "exp", "iat"],
+                         "verify_aud": audience is not None,
+                         "verify_iat": False, "verify_exp": False},
             )
         except Exception as exc:  # noqa: BLE001
-            logger.info("aauth token invalid iss=%s: %s", iss, str(exc)[:200])
-            return None
-        expired = False
-        if tolerate_exp:
-            overdue = int(time.time()) - int(claims.get("exp", 0))
-            expired = overdue >= 0
-            if overdue > EXPIRED_AUTH_TOKEN_GRACE:
-                logger.info("aauth auth token expired %ss ago — past grace iss=%s",
-                            overdue, iss)
-                return None
+            raise _refuse("invalid_jwt", f"token does not verify: {str(exc)[:120]}") from exc
+        now = int(time.time())
+        window = int(cfg.signature_window_seconds)
+        try:
+            exp, iat = int(claims["exp"]), int(claims["iat"])
+        except (TypeError, ValueError) as exc:
+            raise _refuse("invalid_jwt", "exp/iat are not integers") from exc
+        if exp <= now:
+            raise _refuse("expired_jwt", "token exp is in the past")
+        if iat > now + window:
+            raise _refuse("clock_skew", "token iat is ahead of the server's clock")
+        lifetime = exp - iat
+        short_lived = typ in (AAUTH_PERSON_TYP, AAUTH_AUTH_TYP)
+        if short_lived and not 0 < lifetime <= PERSON_TOKEN_MAX_LIFETIME:
+            raise _refuse("invalid_jwt", f"{typ} lifetime {lifetime}s exceeds one hour")
+        jti = claims.get("jti")
+        if (self._is_revoked is not None and isinstance(jti, str) and jti
+                and await self._is_revoked(iss, jti)):
+            raise _refuse("revoked_jwt", "the issuer has withdrawn this token")
 
-        # -11: person and auth tokens live at most one hour.
-        if typ in (AAUTH_PERSON_TYP, AAUTH_AUTH_TYP):
-            lifetime = int(claims.get("exp", 0)) - int(claims.get("iat", 0))
-            if lifetime <= 0 or lifetime > PERSON_TOKEN_MAX_LIFETIME:
-                logger.info("%s lifetime %ss out of bounds iss=%s", typ, lifetime, iss)
-                return None
-
-        # 2) Proof of possession: the request signature must verify against cnf.jwk.
+        # 3) Proof of possession: the request signature must verify against cnf.jwk.
         cnf_jwk = (claims.get("cnf") or {}).get("jwk")
         if not isinstance(cnf_jwk, dict):
-            return None
-        # -11 strict mode: the cnf JWK "MUST carry a fully-specified alg member".
-        if self.config.require_fully_specified_algs and cnf_jwk.get("alg") != "Ed25519":
-            logger.info("cnf.jwk alg %r is not fully-specified iss=%s",
-                        cnf_jwk.get("alg"), iss)
-            return None
-        try:
-            pop_key = load_ed25519_jwk(cnf_jwk)
-        except ValueError:
-            return None
-        verifier = _KeyidOptionalVerifier(
-            signature_algorithm=ED25519,
-            key_resolver=StaticKeyResolver({}, default=pop_key),
-            component_resolver_class=DictKeyComponentResolver,
-        )
-        try:
-            # No expect_label: upstream requires expect_tag alongside it, and the
-            # AAuth drafts' tag is still moving — we verify all signatures against
-            # the possession key and match the Signature-Key label ourselves.
-            results = await asyncio.to_thread(
-                verifier.verify,
-                message,
-                max_age=timedelta(hours=self.config.max_age_hours),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.info("aauth PoP invalid iss=%s: %s", iss, str(exc)[:200])
-            return None
-        if not any(str(r.label) == label for r in results):
-            return None
+            raise _refuse("invalid_key", "token carries no cnf.jwk")
+        if not cfg.require_fully_specified_algs and "alg" not in cnf_jwk:
+            cnf_jwk = {**cnf_jwk, "alg": "Ed25519"}
+        pop_key, algorithm = _load_public_key(cnf_jwk)
+        await self._verify_pop(method, url, headers, label, pop_key, algorithm,
+                               "proof of possession failed")
 
         return VerifiedSignature(
             scheme=scheme,
             agent=iss,
             keyid=jwk_thumbprint(cnf_jwk),
-            # An auth-token issuer is by definition a configured, trusted PS.
-            trusted=iss in self.config.trusted_agents or typ == AAUTH_AUTH_TYP,
+            # An auth-token issuer is by definition a configured, trusted PS/AS.
+            trusted=iss in cfg.trusted_agents or typ == AAUTH_AUTH_TYP,
             sub=str(claims.get("sub", "")),
             label=label,
             claims={
                 k: claims[k]
-                for k in ("iss", "sub", "exp", "ps", "aud", "jti", "mission_s256",
-                          "budget")  # budgets: the envelope rides in the token
+                for k in ("iss", "sub", "exp", "iat", "ps", "aud", "jti", "dwk", "mission_s256",
+                          "tenant", "budget")  # budgets: the envelope rides in the token
                 if k in claims
             },
-            expired=expired,
         )
+
+    async def _verify_server_scheme(
+        self, method: str, url: str, headers: dict[str, str], body: bytes | None,
+        label: str, params: dict[str, Any],
+    ) -> VerifiedSignature:
+        """§11.3.2 / Signature-Key §3.6: ``sig=jwks_uri;id=…;dwk=…;kid=…``."""
+        server_id = str(params.get("id") or "")
+        dwk = str(params.get("dwk") or "")
+        kid = params.get("kid")
+        cfg = self.config
+        dev = bool(server_id) and urlsplit(server_id).hostname in cfg.insecure_hosts
+        if not server_id or (not server_id.startswith("https://") and not dev):
+            raise _refuse("invalid_key", "id is not an https server identifier")
+        if dwk not in SERVER_DWKS:
+            raise _refuse("invalid_key", f"dwk {dwk!r} is not an AAuth metadata document")
+        if not isinstance(kid, str) or not kid:
+            raise _refuse("invalid_key", "kid is required under the jwks_uri scheme")
+        self._check_signature_input(headers, label, body)
+        override = cfg.trusted_ps.get(server_id)
+        jwks_url = await self._issuer_jwks_url(server_id, dwk, override=override or None)
+        jwk = await self._jwks_key(jwks_url, kid)
+        key, algorithm = _load_public_key(jwk)
+        await self._verify_pop(method, url, headers, label, key, algorithm,
+                               "server signature failed")
+        return VerifiedSignature(
+            scheme="aauth-server",
+            agent=server_id,
+            keyid=kid,
+            trusted=server_id in cfg.trusted_ps or server_id in cfg.trusted_agents,
+            label=label,
+            claims={"iss": server_id, "dwk": dwk, "kid": kid},
+        )
+
+
+def _header(headers: Mapping[str, str], name: str) -> str:
+    lname = name.lower()
+    for k, v in headers.items():
+        if k.lower() == lname:
+            return v
+    return ""

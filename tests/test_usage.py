@@ -164,7 +164,9 @@ def _app(meter: InMemoryMeter, iss: str | None,
 
 def test_endpoint_refuses_unauthenticated_ps() -> None:
     client = TestClient(_app(InMemoryMeter(), iss=None))
-    assert client.post("/usage", json={"sub": "s"}).status_code == 401
+    r = client.post("/usage", json={"sub": "s"})
+    assert r.status_code == 401 and r.headers["Signature-Error"] == "error=invalid_signature"
+    assert r.json()["error"] == "invalid_signature"
 
 
 def test_endpoint_rejects_bad_query() -> None:
@@ -178,7 +180,7 @@ async def test_endpoint_end_to_end_signed() -> None:
     meter = InMemoryMeter()
     await _spend(meter, "jti-1", JKT_A, 400)
     seed = b64url(b"\x07" * 32)
-    signer = ResponseSigner(seed=seed, jwks_url="https://api.example/jwks.json")
+    signer = ResponseSigner(seed=seed, server_id="https://api.example")
     client = TestClient(_app(meter, iss=KEY[0], signer=signer))
     r = client.post("/usage", json={"sub": "sub-1", "jkts": [JKT_A, JKT_B]})
     assert r.status_code == 200
@@ -203,7 +205,9 @@ async def test_endpoint_end_to_end_signed() -> None:
     pub = Ed25519PublicKey.from_public_bytes(
         b64url_decode(signer.public_jwk["x"]))
     pub.verify(base64.b64decode(sig_b64), base.encode())  # raises on mismatch
-    assert 'jwks_uri="https://api.example/jwks.json"' in r.headers["signature-key"]
+    assert r.headers["signature-key"] == (  # -11 §11.3.2 server form
+        f'sig=jwks_uri;id="https://api.example";dwk="aauth-resource.json";kid="{signer.keyid}"')
+    assert signer.jwks()["keys"][0]["alg"] == "Ed25519"
 
 
 def test_validate_budget_grant_enforces_declared_units() -> None:

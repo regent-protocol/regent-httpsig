@@ -36,7 +36,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from regent_httpsig.jwk import b64url_decode, jwk_thumbprint
 
 __all__ = ["UsageQueryError", "ResponseSigner", "build_usage_response",
-           "parse_usage_request", "make_usage_endpoint",
+           "parse_usage_request", "make_usage_endpoint", "make_revocation_endpoint",
            "validate_budget_grant"]
 
 _SCOPE_KEYS = ("sub", "tenant", "mission_s256")
@@ -109,19 +109,25 @@ async def build_usage_response(
 class ResponseSigner:
     """Signs a usage response per §The Signed Response: an Ed25519 HTTP Sig
     covering ``@status``, ``content-type``, ``content-digest``, bound to the
-    request via ``@authority``/``@path`` with the ``req`` parameter.
+    request via ``@authority``/``@path`` with the ``req`` parameter. The key is
+    identified the -11 way (§11.3.2): ``Signature-Key: sig=jwks_uri;
+    id="<server_id>";dwk="aauth-resource.json";kid="…"`` — the PS fetches
+    ``{server_id}/.well-known/aauth-resource.json``, follows ``jwks_uri`` and
+    finds ``kid`` there (serve :meth:`jwks`).
 
     Hand-built base string: response signing with request-bound components is
     beyond the request-oriented helper libraries, the component set is fixed by
     the draft, and the golden tests freeze every byte of it.
     """
 
-    def __init__(self, *, seed: str, jwks_url: str, label: str = "sig") -> None:
+    def __init__(self, *, seed: str, server_id: str, dwk: str = "aauth-resource.json",
+                 kid: str | None = None, label: str = "sig") -> None:
         raw = b64url_decode(seed)
         if len(raw) != 32:
             raise ValueError("seed must be 32 bytes (base64url-encoded)")
         self._key = Ed25519PrivateKey.from_private_bytes(raw)
-        self._jwks_url = jwks_url
+        self.server_id = server_id.rstrip("/")
+        self.dwk = dwk
         self._label = label
         self.public_jwk = {
             "kty": "OKP", "crv": "Ed25519",
@@ -129,7 +135,15 @@ class ResponseSigner:
                 self._key.public_key().public_bytes_raw()
             ).rstrip(b"=").decode(),
         }
-        self.keyid = jwk_thumbprint(self.public_jwk)
+        self.keyid = kid or jwk_thumbprint(self.public_jwk)
+
+    def jwks(self) -> dict[str, Any]:
+        """The JWKS to serve at the ``jwks_uri`` your metadata document names."""
+        return {"keys": [{**self.public_jwk, "kid": self.keyid, "alg": "Ed25519", "use": "sig"}]}
+
+    def signature_key_header(self) -> str:
+        return (f'{self._label}=jwks_uri;id="{self.server_id}";'
+                f'dwk="{self.dwk}";kid="{self.keyid}"')
 
     def sign(self, *, status: int, content_type: str, body: bytes,
              authority: str, path: str,
@@ -157,8 +171,39 @@ class ResponseSigner:
             "Content-Digest": digest,
             "Signature-Input": f"{self._label}={inner}",
             "Signature": f"{self._label}=:{sig}:",
-            "Signature-Key": f'{self._label}=jwks_uri; jwks_uri="{self._jwks_url}"',
+            "Signature-Key": self.signature_key_header(),
         }
+
+
+def _problem(status: int, error: str, detail: str,
+             headers: dict[str, str] | None = None) -> Any:
+    """-11 §11.9.2: ``application/problem+json`` with the REQUIRED ``error`` member.
+    Typed ``Any`` because starlette is an optional extra; it is a ``JSONResponse``."""
+    from starlette.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=status, media_type="application/problem+json",
+        content={"error": error, "status": status, "title": error.replace("_", " "),
+                 "detail": detail},
+        headers=headers or {},
+    )
+
+
+async def _caller(authenticate: Callable[[Any], Awaitable[Any]],
+                  request: Any) -> tuple[str | None, Any]:
+    """Normalize what ``authenticate_ps`` returns: an issuer string, a
+    :class:`VerifiedSignature` (its ``agent``), a :class:`VerificationError`
+    (→ 401 + Signature-Error) or ``None`` (→ 401 invalid_signature)."""
+    from regent_httpsig.verify import VerificationError, VerifiedSignature
+
+    result = await authenticate(request)
+    if isinstance(result, VerifiedSignature):
+        return result.agent, None
+    if isinstance(result, str) and result:
+        return result, None
+    error = result if isinstance(result, VerificationError) else VerificationError(
+        "invalid_signature", "sign the request as a server (jwks_uri scheme)")
+    return None, _problem(401, error.code, error.detail, error.headers())
 
 
 def make_usage_endpoint(
@@ -171,19 +216,19 @@ def make_usage_endpoint(
 ) -> Callable[[Any], Awaitable[Any]]:
     """Build an ASGI-framework-agnostic handler: ``handler(request)`` returns a
     Starlette/FastAPI ``Response``. ``authenticate_ps(request)`` verifies the
-    calling person server's signature (jwks_uri scheme, per the AS token
-    endpoint rules) and returns its issuer identifier, or ``None`` to refuse —
-    the resource MUST only answer for values seen in tokens from that PS,
+    calling person server's signature (-11 §11.3.2, jwks_uri scheme) and
+    returns its identity — a ``VerifiedSignature`` from
+    :meth:`HttpsigVerifier.verify_server`, or the issuer string — or a
+    ``VerificationError``/``None`` to refuse with 401 + ``Signature-Error``.
+    The resource MUST only answer for values seen in tokens from that PS,
     which the ``iss``-keyed counters enforce structurally."""
     from starlette.responses import JSONResponse, Response
 
     async def handler(request: Any) -> Response:
-        iss = await authenticate_ps(request)
+        iss, refused = await _caller(authenticate_ps, request)
         if iss is None:
-            return JSONResponse(status_code=401, content={
-                "code": "PS_AUTH_REQUIRED",
-                "message": "Sign the query as a person server (jwks_uri scheme).",
-            })
+            refused_response: Response = refused
+            return refused_response
         try:
             payload = json.loads(await request.body() or b"{}")
             scope_key, scope_value, jkts = parse_usage_request(payload)
@@ -226,46 +271,58 @@ def validate_budget_grant(unit: str, decimals: int,
 def make_revocation_endpoint(
     meter: Any,
     *,
-    authenticate_ps: Callable[[Any], Awaitable[str | None]],
+    authenticate_ps: Callable[[Any], Awaitable[Any]],
+    accepted_issuers: Callable[[str], bool] | None = None,
+    max_token_lifetime: float = 86400.0,
+    clock_skew: float = 60.0,
 ) -> Callable[[Any], Awaitable[Any]]:
-    """The base protocol's revocation endpoint (§Token Revocation) for the
-    budgets meter: a signed ``POST`` identifying an auth token by
-    ``{"iss", "jti"}`` — both REQUIRED, keyed together because a jti is unique
-    only within its issuer. ``200`` when the token was revoked or is already
-    invalid here, ``404`` when the pair is not recognized. The body is
-    deliberately empty on success: the response must not vary with what the
-    recipient holds.
+    """The base protocol's revocation endpoint (-11 §11.12) for the budgets
+    meter: a signed ``POST {"jti", "exp"}``. The issuer is NOT a request
+    parameter — it is the identity verified on the caller's server signature
+    (§11.3.2), so a caller revokes only its own tokens. The pair ``(iss, jti)``
+    is recorded whether or not the token was ever seen here (a resource that
+    verifies statelessly still answers 200), and the answer is always an empty
+    ``200``: there is no "not found" (Appendix C.2.7).
 
-    ``authenticate_ps`` is the same pinned-PS check the usage endpoint uses.
-    The issuer named in the body must be the caller: a PS revokes tokens it
-    issued, never another issuer's. What revocation does to the meter is in
-    :meth:`InMemoryMeter.revoke` — no new spend, in-flight requests complete,
-    and the token's consumption record is withheld until they have (AAuth
-    issue #151: a record issued after the revocation is then final)."""
-    from starlette.responses import JSONResponse, Response
+    Errors (§11.12.3, problem+json): ``invalid_request`` 400 for malformed
+    JSON or a missing/malformed ``jti``/``exp`` — including an ``exp`` further
+    ahead than ``max_token_lifetime`` + ``clock_skew``, the longest lifetime
+    this resource accepts; ``unsupported_iss`` 403 when ``accepted_issuers``
+    says no (default: any verified caller); a signature that does not verify
+    is 401 + ``Signature-Error``. ``rate_limited`` and ``server_error`` are
+    the application's to raise.
+
+    What revocation does to the meter is :meth:`InMemoryMeter.record_revocation`:
+    no new spend, in-flight requests complete, and the token's consumption
+    record is withheld until they have (AAuth #151); a later presentation of
+    the token is refused with ``revoked_jwt`` (§11.12.5)."""
+    from starlette.responses import Response
 
     async def handler(request: Any) -> Response:
-        caller = await authenticate_ps(request)
+        caller, refused = await _caller(authenticate_ps, request)
         if caller is None:
-            return JSONResponse(status_code=401, content={
-                "code": "PS_AUTH_REQUIRED",
-                "message": "Sign the revocation as the person server that issued the token.",
-            })
+            refused_response: Response = refused
+            return refused_response
+        if accepted_issuers is not None and not accepted_issuers(caller):
+            unsupported: Response = _problem(
+                403, "unsupported_iss",
+                "this resource does not accept revocations from that issuer")
+            return unsupported
         try:
-            payload = json.loads(await request.body() or b"{}")
-            iss, jti = payload.get("iss"), payload.get("jti")
-            if not isinstance(iss, str) or not isinstance(jti, str) or not iss or not jti:
-                raise ValueError("iss and jti are REQUIRED strings")
+            payload = json.loads(await request.body() or b"")
+            if not isinstance(payload, dict):
+                raise ValueError("body must be a JSON object")
+            jti, exp = payload.get("jti"), payload.get("exp")
+            if not isinstance(jti, str) or not jti or len(jti) > 512:
+                raise ValueError("jti is REQUIRED (string)")
+            if isinstance(exp, bool) or not isinstance(exp, int | float):
+                raise ValueError("exp is REQUIRED (integer seconds)")
+            if exp > time.time() + max_token_lifetime + clock_skew:
+                raise ValueError("exp is further ahead than any token this resource accepts")
         except (ValueError, json.JSONDecodeError) as exc:
-            return JSONResponse(status_code=400, content={
-                "code": "INVALID_REVOCATION", "message": str(exc)})
-        if iss.rstrip("/") != caller.rstrip("/"):
-            return JSONResponse(status_code=403, content={
-                "code": "NOT_YOUR_TOKEN",
-                "message": "A person server may revoke only tokens it issued."})
-        if not await meter.revoke(iss, jti):
-            return JSONResponse(status_code=404, content={
-                "code": "TOKEN_UNKNOWN", "message": "No such (iss, jti) here."})
+            invalid: Response = _problem(400, "invalid_request", str(exc)[:200])
+            return invalid
+        await meter.record_revocation(caller, jti, float(exp))
         return Response(status_code=200)
 
     return handler

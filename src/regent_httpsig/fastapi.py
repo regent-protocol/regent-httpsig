@@ -13,9 +13,12 @@ Usage::
         if sig:
             ...  # sig.agent == "https://chatgpt.com", sig.keyid, sig.trusted
 
-``SignatureDep`` is enrichment: ``None`` when absent/invalid, never raises.
-``RequiredSignatureDep`` is authentication: a coded 401 tells the agent exactly
-how to sign.
+``SignatureDep`` is enrichment: ``None`` when absent/invalid, never raises
+(``SignatureErrorDep`` tells you why). ``RequiredSignatureDep`` is
+authentication: a signed request that fails is answered ``401`` with the
+``Signature-Error`` header of draft-hardt-httpbis-signature-key (the code
+AAuth -11 §11.3.4 assigns), an unsigned one with ``AAuth-Requirement:
+requirement=agent-token`` (-11 §6.1).
 
 Proxy note: the signer signed the PUBLIC url. Behind a reverse proxy this
 dependency rebuilds it from ``X-Forwarded-Proto`` + ``Host`` — make sure your
@@ -44,15 +47,31 @@ from regent_httpsig.budget import (
     TokenRevoked,
     UnitMismatch,
 )
-from regent_httpsig.sfv import build_aauth_budget_header, build_aauth_requirement
-from regent_httpsig.verify import HttpsigVerifier, VerifiedSignature
+from regent_httpsig.sfv import (
+    build_aauth_budget_header,
+    build_aauth_requirement,
+    build_person_token_requirement,
+)
+from regent_httpsig.verify import (
+    AAUTH_AUTH_TYP,
+    AAUTH_PERSON_TYP,
+    HttpsigVerifier,
+    VerificationError,
+    VerifiedSignature,
+)
 
 __all__ = [
     "BudgetMiddleware",
     "RequiredSignatureDep",
     "SignatureDep",
+    "SignatureErrorDep",
+    "VerificationError",
     "VerifiedSignature",
     "attach",
+    "get_signature",
+    "get_signature_error",
+    "require_server_signature",
+    "signature_error_response",
 ]
 
 _STATE_ATTR = "regent_httpsig_verifier"
@@ -74,49 +93,128 @@ def _public_url(request: Request) -> str:
     return f"{scheme}://{host}{path}{query}"
 
 
-async def get_signature(request: Request) -> VerifiedSignature | None:
-    """Optional verification: zero-cost without a Signature header, never raises."""
+def _verifier_of(request: Request) -> HttpsigVerifier:
     verifier: HttpsigVerifier | None = getattr(request.app.state, _STATE_ATTR, None)
     if verifier is None:
         raise RuntimeError(
             "regent-httpsig verifier not attached — call "
             "regent_httpsig.fastapi.attach(app, HttpsigVerifier()) at startup"
         )
-    if "signature" not in request.headers:
-        return None
-    cached = getattr(request.state, "regent_httpsig_result", "unset")
+    return verifier
+
+
+async def _run_verifier(
+    verifier: HttpsigVerifier, request: Request,
+) -> VerifiedSignature | VerificationError | None:
+    """Verify once per request; both outcomes are cached on ``request.state``."""
+    cached: Any = getattr(request.state, "regent_httpsig_outcome", "unset")
     if cached != "unset":
-        return cached  # type: ignore[return-value]
-    result = await verifier.verify(
-        request.method, _public_url(request), dict(request.headers)
-    )
-    request.state.regent_httpsig_result = result
-    return result
+        return cached if isinstance(cached, VerifiedSignature | VerificationError) else None
+    outcome: VerifiedSignature | VerificationError | None = None
+    if "signature" in request.headers:
+        # The -11 body rule (content-digest covered and matching) applies to the
+        # Signature-Key path; Web Bot Auth has no such rule and needs no body.
+        body = await request.body() if "signature-key" in request.headers else None
+        outcome = await verifier.verify_detailed(
+            request.method, _public_url(request), dict(request.headers), body,
+        )
+    request.state.regent_httpsig_outcome = outcome
+    request.state.regent_httpsig_result = (
+        outcome if isinstance(outcome, VerifiedSignature) else None)
+    request.state.regent_httpsig_error = (
+        outcome if isinstance(outcome, VerificationError) else None)
+    return outcome
+
+
+def signature_error_response(
+    error: VerificationError, *, code: str | None = None, requirement: str | None = None,
+) -> JSONResponse:
+    """``401`` + ``Signature-Error`` (+ ``Accept-Signature-*``) with the
+    problem+json body of draft-hardt-httpbis-signature-key §5. ``requirement``
+    adds an ``AAuth-Requirement`` header; ``code`` adds a legacy ``code`` member."""
+    headers = error.headers()
+    if requirement:
+        headers["AAuth-Requirement"] = requirement
+    body = error.problem(401)
+    if code:
+        body["code"] = code
+    return JSONResponse(status_code=401, content=body, headers=headers,
+                        media_type="application/problem+json")
+
+
+def _repair_requirement(error: VerificationError) -> str | None:
+    """-11 §11.12.5 / budgets "auth token expired": a revoked or expired person
+    or auth token is repaired by a fresh person token; nothing repairs an agent
+    token (the agent obtains a new one from its provider)."""
+    if error.code in ("revoked_jwt", "expired_jwt") and error.token_typ in (
+        AAUTH_PERSON_TYP, AAUTH_AUTH_TYP,
+    ):
+        return build_person_token_requirement()
+    return None
+
+
+async def get_signature(request: Request) -> VerifiedSignature | None:
+    """Optional verification: zero-cost without a Signature header, never raises."""
+    outcome = await _run_verifier(_verifier_of(request), request)
+    return outcome if isinstance(outcome, VerifiedSignature) else None
+
+
+async def get_signature_error(request: Request) -> VerificationError | None:
+    """Why a signed request did not verify (``None`` when unsigned or verified)."""
+    outcome = await _run_verifier(_verifier_of(request), request)
+    return outcome if isinstance(outcome, VerificationError) else None
 
 
 async def require_signature(request: Request) -> VerifiedSignature:
     """Hard requirement: a fully verified signature, or a 401 that tells the
-    agent exactly how to sign."""
-    sig = await get_signature(request)
-    if sig is None:
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "code": "SIGNATURE_REQUIRED",
-                "message": (
-                    "Sign this request with RFC 9421 HTTP Message Signatures: either "
-                    'Web Bot Auth (tag="web-bot-auth", Ed25519 key published at '
-                    "{your-origin}/.well-known/http-message-signatures-directory, "
-                    "Signature-Agent header naming that origin) or AAuth (agent_token "
-                    "in the Signature-Key header, signature bound to its cnf.jwk)."
-                ),
-            },
-        )
-    return sig
+    agent exactly what went wrong (``Signature-Error``) or what to present
+    (``AAuth-Requirement: requirement=agent-token``)."""
+    outcome = await _run_verifier(_verifier_of(request), request)
+    if isinstance(outcome, VerifiedSignature):
+        return outcome
+    if isinstance(outcome, VerificationError):
+        headers = outcome.headers()
+        requirement = _repair_requirement(outcome)
+        if requirement:
+            headers["AAuth-Requirement"] = requirement
+        raise HTTPException(status_code=401, headers=headers,
+                            detail={**outcome.problem(401), "code": "SIGNATURE_INVALID"})
+    raise HTTPException(
+        status_code=401,
+        headers={"AAuth-Requirement": "requirement=agent-token"},
+        detail={
+            "code": "SIGNATURE_REQUIRED",
+            "message": (
+                "Sign this request with RFC 9421 HTTP Message Signatures: either "
+                "AAuth (your agent token in the Signature-Key header under the jwt "
+                "scheme, signature over @method @authority @path signature-key bound "
+                'to its cnf.jwk) or Web Bot Auth (tag="web-bot-auth", Ed25519 key '
+                "published at {your-origin}/.well-known/http-message-signatures-directory, "
+                "Signature-Agent header naming that origin)."
+            ),
+        },
+    )
+
+
+async def require_server_signature(request: Request) -> VerifiedSignature:
+    """For endpoints servers call (usage, revocation): the caller must sign
+    under the ``jwks_uri`` scheme (-11 §11.3.2); the body is covered. A
+    failure is ``401`` + ``Signature-Error``."""
+    verifier = _verifier_of(request)
+    body = await request.body()
+    outcome = await verifier.verify_server(
+        request.method, _public_url(request), dict(request.headers), body,
+    )
+    if isinstance(outcome, VerifiedSignature):
+        return outcome
+    raise HTTPException(status_code=401, headers=outcome.headers(),
+                        detail={**outcome.problem(401), "code": "SIGNATURE_INVALID"})
 
 
 SignatureDep = Depends(get_signature)
+SignatureErrorDep = Depends(get_signature_error)
 RequiredSignatureDep = Depends(require_signature)
+RequiredServerSignatureDep = Depends(require_server_signature)
 
 
 # ── AAuth Budgets enforcement (draft-hardt-aauth-budgets) ────────────────────
@@ -133,20 +231,17 @@ async def _maybe_await(value: Any) -> Any:
 
 class BudgetMiddleware(BaseHTTPMiddleware):
     """Meter budget-carrying requests: reserve the maximum cost atomically,
-    serve, commit the actual, release the difference, and answer with an
-    ``AAuth-Budget`` header. The full checklist a resource owes the draft —
-    pricing excepted, which is the one thing only the resource can know.
+    serve, commit the actual cost, answer with ``AAuth-Budget``.
 
-    Usage::
+    ::
 
-        meter = InMemoryMeter()
         app.add_middleware(
             BudgetMiddleware,
             verifier=HttpsigVerifier(HttpsigConfig(
                 resource_url="https://api.example",
                 trusted_ps={"https://ps.example": "https://ps.example/jwks.json"},
             )),
-            meter=meter,
+            meter=InMemoryMeter(),
             price_fn=lambda request: PRICES.get(request.url.path),
         )
 
@@ -157,6 +252,12 @@ class BudgetMiddleware(BaseHTTPMiddleware):
     - ``require=False`` (default) lets requests without a budget envelope pass
       through untouched — run per-decision authorization for them instead.
       ``require=True`` refuses them with 401 + ``AAuth-Requirement``.
+    - A *signed* request that does not verify is refused with ``401`` +
+      ``Signature-Error`` (-11 §11.3.4) whatever ``require`` says. A revoked or
+      expired auth token is ``revoked_jwt`` / ``expired_jwt`` plus
+      ``AAuth-Requirement: requirement=person-token`` (-11 §11.12.5) — no
+      resource token, no ``AAuth-Budget``; its final consumption record reaches
+      the issuer through the usage endpoint.
     - Error responses (4xx/5xx) release the reservation — nothing was served,
       the envelope is not charged.
     - ``resource_token_provider(key, record)`` (optional) mints the resource
@@ -165,6 +266,10 @@ class BudgetMiddleware(BaseHTTPMiddleware):
       the PRESENTED token's ``{"jti", "consumed"}`` (draft §The Consumption
       Record — one record, two members) or ``None`` when nothing was metered
       against it yet.
+    - Wire the verifier to the meter's revocation record
+      (``HttpsigVerifier(..., is_revoked=meter.is_revoked)``) so a revoked
+      token is named as revoked before it is metered; the middleware checks the
+      meter too, for verifiers wired otherwise.
     """
 
     def __init__(
@@ -191,14 +296,10 @@ class BudgetMiddleware(BaseHTTPMiddleware):
         if max_cost is None:
             return await call_next(request)
 
-        sig = await self._verified(request)
-        if sig is not None and sig.expired:
-            # §Budget Exhaustion, "auth token expired": the base protocol's plain
-            # 401 — and the resource token we attach carries the presented
-            # token's FINAL consumption record (stated at/after its exp), which
-            # is what lets its issuer settle the allocation exactly. Without
-            # this challenge an issuer never sees a final figure at all.
-            return await self._expired_challenge(sig)
+        outcome = await _run_verifier(self._verifier, request)
+        if isinstance(outcome, VerificationError):
+            return self._signature_error(outcome)
+        sig = outcome
         envelope: BudgetClaim | None = None
         if sig is not None:
             try:
@@ -217,6 +318,9 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             str(sig.claims.get("sub", "")),
             str(sig.claims.get("aud", "")),
         )
+        is_revoked = getattr(self._meter, "is_revoked", None)
+        if is_revoked is not None and await is_revoked(key[0], jti):
+            return self._revoked()
         try:
             # sig.keyid is the RFC 7638 thumbprint of the token's cnf key (jkt) —
             # recorded so refusal-time consumption records are scoped to the
@@ -229,23 +333,23 @@ class BudgetMiddleware(BaseHTTPMiddleware):
             return self._refusal(reason="insufficient-budget", envelope=envelope,
                                  remaining=0, key=key)
 
-        outcome = await self._meter.reserve(key, jti, int(max_cost))
-        if isinstance(outcome, TokenRevoked):
-            # §Token Scope: the budget ended with the token. The challenge is
-            # the base protocol's plain one; the resource token on it carries
-            # the token's FINAL record once nothing is in flight (AAuth #151).
-            return await self._revoked_challenge(key, jti, outcome.drained)
-        if isinstance(outcome, InsufficientBudget):
-            reason = "budget-exhausted" if outcome.exhausted else "insufficient-budget"
+        outcome_r = await self._meter.reserve(key, jti, int(max_cost))
+        if isinstance(outcome_r, TokenRevoked):
+            # §Token Scope / -11 §11.12.5: say it was revoked, ask for a person
+            # token, carry no resource token. The final record (once nothing is
+            # in flight, AAuth #151) is the usage endpoint's to report.
+            return self._revoked()
+        if isinstance(outcome_r, InsufficientBudget):
+            reason = "budget-exhausted" if outcome_r.exhausted else "insufficient-budget"
             return await self._refusal_with_token(
-                reason=reason, envelope=envelope, remaining=outcome.remaining,
+                reason=reason, envelope=envelope, remaining=outcome_r.remaining,
                 key=key, jti=jti,
                 # `required` rides only on insufficient-budget: what THIS
                 # request needed, so the agent can lower its bound and retry.
                 required=int(max_cost) if reason == "insufficient-budget" else None,
             )
 
-        reservation: Reservation = outcome
+        reservation: Reservation = outcome_r
         try:
             response = await call_next(request)
         except Exception:
@@ -292,90 +396,42 @@ class BudgetMiddleware(BaseHTTPMiddleware):
 
     def _commit_after_stream(self, request: Request, response: Response,
                              reservation: Reservation, max_cost: int) -> None:
-        """Wrap the body iterator: commit when the stream ends (the handler may
-        set ``request.state.budget_cost`` while streaming), release the unspent
-        remainder; a broken stream commits the full hold — conservative, per
-        the reservation-timeout rule."""
-        inner = response.body_iterator  # type: ignore[attr-defined]
+        """Wrap the body iterator so the reservation is committed (at the
+        handler's actual cost if it set one mid-stream, else the full hold)
+        when the stream ends, and released if it breaks before a byte is sent."""
+        meter = self._meter
+        original = response.body_iterator  # type: ignore[attr-defined]
 
         async def metered() -> Any:
-            ok = False
+            sent = False
             try:
-                async for chunk in inner:
+                async for chunk in original:
+                    sent = True
                     yield chunk
-                ok = True
-            finally:
-                actual = getattr(request.state, "budget_cost", None)
-                cost = int(actual) if (ok and actual is not None) else max_cost
-                await self._meter.commit(reservation, cost)
+            except BaseException:
+                await (meter.commit(reservation, max_cost) if sent
+                       else meter.release(reservation))
+                raise
+            actual = getattr(request.state, "budget_cost", None)
+            await meter.commit(reservation,
+                               int(actual) if actual is not None else max_cost)
 
         response.body_iterator = metered()  # type: ignore[attr-defined]
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
-    async def _verified(self, request: Request) -> VerifiedSignature | None:
-        cached = getattr(request.state, "regent_httpsig_result", "unset")
-        if cached != "unset":
-            return cached  # type: ignore[return-value]
-        result = None
-        if "signature" in request.headers:
-            result = await self._verifier.verify(
-                request.method, _public_url(request), dict(request.headers),
-                allow_expired_auth_token=True,
-            )
-        # An expired token is never handed to the app: the middleware answers
-        # it with the final-record challenge and nothing downstream runs. The
-        # per-request cache still must not carry it — a later dependency
-        # reading the cache would otherwise see a token that is not valid.
-        request.state.regent_httpsig_result = (
-            None if result is not None and result.expired else result)
-        return result
+    def _signature_error(self, error: VerificationError) -> Response:
+        code = {"revoked_jwt": "AUTH_TOKEN_REVOKED", "expired_jwt": "AUTH_TOKEN_EXPIRED"}.get(
+            error.code, "SIGNATURE_INVALID")
+        return signature_error_response(error, code=code,
+                                        requirement=_repair_requirement(error))
 
-    async def _revoked_challenge(self, key: MeterKey, jti: str, drained: bool) -> Response:
-        token: str | None = None
-        if self._resource_token is not None:
-            try:
-                record = await self._meter.consumed_record(key, jti) if drained else None
-                token = await _maybe_await(self._resource_token(key, record))
-            except Exception:  # noqa: BLE001 — the challenge must not fail on the extras
-                logger.warning("resource_token_provider failed", exc_info=True)
-        return JSONResponse(
-            status_code=401,
-            content={
-                "code": "AUTH_TOKEN_REVOKED",
-                "message": "This auth token was revoked by its issuer. Take the resource "
-                           "token in AAuth-Requirement to your PS for a fresh one."
-                           + ("" if drained else " Its final consumption record follows once "
-                              "in-flight requests settle."),
-            },
-            headers={"AAuth-Requirement": build_aauth_requirement(
-                reason=None, resource_token=token)},
-        )
-
-    async def _expired_challenge(self, sig: VerifiedSignature) -> Response:
-        jti = str(sig.claims.get("jti") or "")
-        key: MeterKey = (
-            str(sig.claims.get("iss", "")),
-            str(sig.claims.get("sub", "")),
-            str(sig.claims.get("aud", "")),
-        )
-        token: str | None = None
-        if self._resource_token is not None and jti:
-            try:
-                record = await self._meter.consumed_record(key, jti)
-                token = await _maybe_await(self._resource_token(key, record))
-            except Exception:  # noqa: BLE001 — the challenge must not fail on the extras
-                logger.warning("resource_token_provider failed", exc_info=True)
-        return JSONResponse(
-            status_code=401,
-            content={
-                "code": "AUTH_TOKEN_EXPIRED",
-                "message": "The auth token has expired. Take the resource token in "
-                           "AAuth-Requirement to your PS for a fresh one.",
-            },
-            headers={"AAuth-Requirement": build_aauth_requirement(
-                reason=None, resource_token=token)},
-        )
+    def _revoked(self) -> Response:
+        """The meter knows the token is revoked (the verifier was not wired to
+        it, or learned out of band): the same -11 §11.12.5 answer."""
+        error = VerificationError("revoked_jwt", "the issuer has withdrawn this token",
+                                  token_typ=AAUTH_AUTH_TYP)
+        return self._signature_error(error)
 
     async def _refusal_with_token(
         self, *, reason: str, envelope: BudgetClaim,

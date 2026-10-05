@@ -105,7 +105,7 @@ def signed_usage_response() -> dict:
     """A fully worked signed usage response with a FIXED key and timestamp —
     verify it independently: Ed25519 over the base string below."""
     seed = b64url(bytes(range(32)))
-    signer = ResponseSigner(seed=seed, jwks_url="https://api.example/jwks.json")
+    signer = ResponseSigner(seed=seed, server_id="https://api.example")
     body_doc = {
         "as_of": 1756500000,
         "aud": "https://ps.example",

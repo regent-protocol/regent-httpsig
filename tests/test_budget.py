@@ -276,7 +276,7 @@ def _auth_token(ps_priv: Ed25519PrivateKey, agent: EgressSigner, *,
     return pyjwt.encode(
         {
             "iss": PS_ISS, "sub": "owner-1", "aud": RESOURCE, "jti": jti,
-            "iat": now, "exp": now + 600,
+            "iat": now, "exp": now + 600, "dwk": "aauth-person.json",
             "budget": {"amount": amount, "unit": "KZT", "decimals": 2},
             "cnf": {"jwk": agent.public_jwk},
         },
@@ -328,11 +328,12 @@ def _mock_fetch(mapping: dict[str, dict[str, Any]]):  # type: ignore[no-untyped-
     return fetch
 
 
-def _verifier(ps_jwk: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> HttpsigVerifier:
+def _verifier(ps_jwk: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+              meter: InMemoryMeter | None = None) -> HttpsigVerifier:
     verifier = HttpsigVerifier(HttpsigConfig(
         resource_url=RESOURCE,
         trusted_ps={PS_ISS: f"{PS_ISS}/jwks.json"},
-    ))
+    ), is_revoked=meter.is_revoked if meter is not None else None)
     monkeypatch.setattr(
         verifier, "_fetch_json",
         _mock_fetch({f"{PS_ISS}/jwks.json": {"keys": [ps_jwk]}}),
@@ -341,9 +342,7 @@ def _verifier(ps_jwk: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Httpsi
 
 
 def _signed_headers(agent: EgressSigner, token: str, path: str) -> dict[str, str]:
-    headers = agent.sign("POST", f"{RESOURCE}{path}", {"Host": "api.example"})
-    headers["Signature-Key"] = f'sig1=jwt;jwt="{token}"'
-    return headers
+    return agent.sign_aauth("POST", f"{RESOURCE}{path}", {"Host": "api.example"}, token=token)
 
 
 async def _post(app: FastAPI, path: str, headers: dict[str, str]) -> httpx.Response:
@@ -504,13 +503,13 @@ async def test_streaming_cost_omitted_reserved_math(
     assert 700 + 300 - next_remaining == 120     # …prev + reserved − next = cost
 
 
-async def test_expired_token_gets_final_record_challenge(
+async def test_expired_auth_token_is_expired_jwt_with_person_token_requirement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """§Budget Exhaustion, "auth token expired": plain requirement=auth-token
-    (no reason) + a resource token carrying the token's FINAL record — the
-    figure the issuer needs to settle the allocation (§Settlement: a record
-    stated at/after exp is final)."""
+    """Budgets editor's copy (06.10) "auth token expired" + -11 RS-51: the
+    resource names the token expired (Signature-Error: expired_jwt) and asks
+    for a person token. No resource token, no AAuth-Budget — the final record
+    reaches the issuer through the usage endpoint, not on the challenge."""
     ps_priv, ps_jwk = _ps_pair()
     agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
     live = _auth_token(ps_priv, agent, amount=1000, jti="at-9")
@@ -523,52 +522,52 @@ async def test_expired_token_gets_final_record_challenge(
     meter = InMemoryMeter()
     app = _app(_verifier(ps_jwk, monkeypatch), meter=meter,
                resource_token_provider=provider)
-    # Spend 300 on the live token, so there is a figure to carry.
     r = await _post(app, "/v1/search", _signed_headers(agent, live, "/v1/search"))
     assert r.status_code == 200
 
-    # The same jti, now past its exp (same issuer, same key, same claims).
     stale = _auth_token(ps_priv, agent, amount=1000, jti="at-9", age=700)
     r = await _post(app, "/v1/search", _signed_headers(agent, stale, "/v1/search"))
     assert r.status_code == 401
-    assert r.json()["code"] == "AUTH_TOKEN_EXPIRED"
-    assert (r.headers["AAuth-Requirement"]
-            == 'requirement=auth-token;resource-token="resource.token.final"')
-    assert "AAuth-Budget" not in r.headers  # the budget didn't run out; the token did
-    assert provider_calls[-1] == ((PS_ISS, "owner-1", RESOURCE),
-                                  {"jti": "at-9", "consumed": 300})
-    # Nothing was served and nothing more was metered.
+    assert r.headers["content-type"].startswith("application/problem+json")
+    assert r.json()["error"] == "expired_jwt" and r.json()["code"] == "AUTH_TOKEN_EXPIRED"
+    assert r.headers["Signature-Error"] == "error=expired_jwt"
+    assert r.headers["AAuth-Requirement"] == "requirement=person-token"
+    assert "AAuth-Budget" not in r.headers
+    assert not provider_calls  # no resource token on a revoked/expired challenge
+    # Nothing was served and nothing more was metered; the usage endpoint
+    # still holds the token's figure for the PS.
     assert await meter.consumed_record(
         (PS_ISS, "owner-1", RESOURCE), "at-9") == {"jti": "at-9", "consumed": 300}
+    assert await meter.usage_scope(PS_ISS, "owner-1") is not None
 
 
-async def test_expired_token_past_grace_is_no_envelope(
+async def test_plain_verify_rejects_expired_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Beyond the grace window there is no figure left to carry: the token is
-    just an unknown one and the request falls through as unsigned."""
-    ps_priv, ps_jwk = _ps_pair()
-    agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
-    ancient = _auth_token(ps_priv, agent, amount=1000, jti="at-old", age=3 * 3600)
-    app = _app(_verifier(ps_jwk, monkeypatch), require=True)
-    r = await _post(app, "/v1/search", _signed_headers(agent, ancient, "/v1/search"))
-    assert r.status_code == 401 and r.json()["code"] == "AUTH_TOKEN_REQUIRED"
-
-
-async def test_plain_verify_still_rejects_expired_tokens(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The tolerance is opt-in for the budgets middleware only: an access
-    decision through ``verify()`` never sees an expired token as verified."""
     ps_priv, ps_jwk = _ps_pair()
     agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
     stale = _auth_token(ps_priv, agent, amount=1000, jti="at-9", age=700)
     verifier = _verifier(ps_jwk, monkeypatch)
     headers = _signed_headers(agent, stale, "/v1/search")
     assert await verifier.verify("POST", f"{RESOURCE}/v1/search", headers) is None
-    sig = await verifier.verify("POST", f"{RESOURCE}/v1/search", headers,
-                                allow_expired_auth_token=True)
-    assert sig is not None and sig.expired
+    err = await verifier.verify_detailed("POST", f"{RESOURCE}/v1/search", headers)
+    assert err.code == "expired_jwt" and err.token_typ == "aa-auth+jwt"
+
+
+async def test_middleware_refuses_invalid_signature_with_signature_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """-11 §11.3.4: a signed request that does not verify is 401 + Signature-Error
+    on a priced route — it is never treated as unsigned."""
+    ps_priv, ps_jwk = _ps_pair()
+    agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
+    token = _auth_token(ps_priv, agent, amount=1000)
+    headers = _signed_headers(agent, token, "/v1/search")
+    headers["Signature"] = headers["Signature"][:-6] + "AAAA=:"  # corrupt the signature
+    r = await _post(_app(_verifier(ps_jwk, monkeypatch)), "/v1/search", headers)
+    assert r.status_code == 401
+    assert r.headers["Signature-Error"] == "error=invalid_signature"
+    assert "AAuth-Requirement" not in r.headers
 
 
 # ── revocation (base protocol §Token Revocation · budgets §Token Scope · AAuth #151) ──
@@ -600,13 +599,13 @@ async def test_meter_revoke_drains_before_final_record() -> None:
     assert await meter.reserve(KEY, "jti-r", 1) == TokenRevoked(drained=True)
 
 
-def _revocation_app(meter: InMemoryMeter, caller: str | None) -> FastAPI:
+def _revocation_app(meter: InMemoryMeter, caller: Any, **kw: Any) -> FastAPI:
     from regent_httpsig import make_revocation_endpoint
 
-    async def auth(request: Any) -> str | None:
+    async def auth(request: Any) -> Any:
         return caller
 
-    handler = make_revocation_endpoint(meter, authenticate_ps=auth)
+    handler = make_revocation_endpoint(meter, authenticate_ps=auth, **kw)
     app = FastAPI()
 
     @app.post("/revoke")
@@ -617,30 +616,74 @@ def _revocation_app(meter: InMemoryMeter, caller: str | None) -> FastAPI:
 
 
 async def test_revocation_endpoint_contract() -> None:
+    """-11 §11.12.1–3: body {jti, exp}; iss from the verified caller; the pair
+    is recorded whether or not known here; 200 empty always; problem+json
+    errors invalid_request / unsupported_iss; a failed signature is 401 +
+    Signature-Error."""
     from starlette.testclient import TestClient
+
+    from regent_httpsig import VerificationError
 
     meter = InMemoryMeter()
     await meter.observe_grant(KEY, "jti-e", _claim(500), time.time() + 600)
-    # Unauthenticated → 401, nothing revoked.
-    r = TestClient(_revocation_app(meter, None)).post(
-        "/revoke", json={"iss": PS_ISS, "jti": "jti-e"})
-    assert r.status_code == 401
+    exp = int(time.time()) + 600
+
+    # Signature failed → 401 with the verifier's code; nothing revoked.
+    r = TestClient(_revocation_app(meter, VerificationError("invalid_key", "nope"))).post(
+        "/revoke", json={"jti": "jti-e", "exp": exp})
+    assert r.status_code == 401 and r.headers["Signature-Error"] == "error=invalid_key"
+    assert r.json()["error"] == "invalid_key"
+    r = TestClient(_revocation_app(meter, None)).post("/revoke", json={"jti": "jti-e", "exp": exp})
+    assert r.status_code == 401 and r.headers["Signature-Error"] == "error=invalid_signature"
     assert isinstance(await meter.reserve(KEY, "jti-e", 1), Reservation)
+
     client = TestClient(_revocation_app(meter, PS_ISS))
-    assert client.post("/revoke", json={"iss": PS_ISS}).status_code == 400       # jti REQUIRED
-    other = {"iss": "https://other.example", "jti": "jti-e"}
-    assert client.post("/revoke", json=other).status_code == 403
-    assert client.post("/revoke", json={"iss": PS_ISS, "jti": "ghost"}).status_code == 404
-    r = client.post("/revoke", json={"iss": PS_ISS, "jti": "jti-e"})
-    assert r.status_code == 200 and r.content == b""                            # empty on success
-    again = client.post("/revoke", json={"iss": PS_ISS, "jti": "jti-e"})
-    assert again.status_code == 200  # already invalid → still 200
+    assert client.post("/revoke", json={"jti": "jti-e"}).status_code == 400          # exp REQUIRED
+    assert client.post("/revoke", json={"exp": exp}).status_code == 400              # jti REQUIRED
+    assert client.post("/revoke", json={"jti": "jti-e", "exp": "soon"}).status_code == 400
+    far = client.post("/revoke", json={"jti": "jti-e", "exp": exp + 7 * 86400})
+    assert far.status_code == 400 and far.json()["error"] == "invalid_request"  # > 24h + skew
+    assert client.post("/revoke", content=b"not json",
+                       headers={"content-type": "application/json"}).status_code == 400
+    assert isinstance(await meter.reserve(KEY, "jti-e", 1), Reservation)             # still live
+
+    # An issuer this resource does not accept → unsupported_iss, nothing recorded.
+    picky = TestClient(_revocation_app(meter, "https://stranger.example",
+                                       accepted_issuers=lambda iss: iss == PS_ISS))
+    r = picky.post("/revoke", json={"jti": "jti-e", "exp": exp})
+    assert r.status_code == 403 and r.json()["error"] == "unsupported_iss"
+    assert not await meter.is_revoked("https://stranger.example", "jti-e")
+
+    # A pair never seen here is recorded all the same (statelessly verified
+    # tokens): 200, empty — there is no "not found".
+    r = client.post("/revoke", json={"jti": "ghost", "exp": exp})
+    assert r.status_code == 200 and r.content == b""
+    assert await meter.is_revoked(PS_ISS, "ghost")
+
+    r = client.post("/revoke", json={"jti": "jti-e", "exp": exp})
+    assert r.status_code == 200 and r.content == b""
+    again = client.post("/revoke", json={"jti": "jti-e", "exp": exp})
+    assert again.status_code == 200  # idempotent
     assert isinstance(await meter.reserve(KEY, "jti-e", 1), TokenRevoked)
+    assert await meter.is_revoked(PS_ISS, "jti-e")
 
 
-async def test_middleware_revoked_token_gets_challenge_then_final_record(
+async def test_revocation_record_expires_with_the_token() -> None:
+    meter = InMemoryMeter()
+    await meter.record_revocation(PS_ISS, "short", time.time() - 120)  # exp already past + skew
+    assert not await meter.is_revoked(PS_ISS, "short")
+    await meter.record_revocation(PS_ISS, "live", time.time() + 120)
+    assert await meter.is_revoked(PS_ISS, "live")
+
+
+async def test_middleware_revoked_token_is_revoked_jwt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """RS-43 / -11 §11.12.5: a revoked auth token is answered revoked_jwt plus
+    requirement=person-token; no resource token rides on it (the PS would
+    reject one naming a revoked token), and the final record is the usage
+    endpoint's. Both wirings — verifier hooked to the meter, or the meter
+    alone — give the same answer."""
     ps_priv, ps_jwk = _ps_pair()
     agent = EgressSigner(seed=generate_seed(), signature_agent=PS_ISS)
     token = _auth_token(ps_priv, agent, amount=1000, jti="at-rv")
@@ -650,17 +693,22 @@ async def test_middleware_revoked_token_gets_challenge_then_final_record(
         calls.append(record)
         return "resource.token.rv"
 
-    meter = InMemoryMeter()
-    app = _app(_verifier(ps_jwk, monkeypatch), meter=meter, resource_token_provider=provider)
-    first = await _post(app, "/v1/search", _signed_headers(agent, token, "/v1/search"))
-    assert first.status_code == 200
+    for wired in (True, False):
+        meter = InMemoryMeter()
+        verifier = _verifier(ps_jwk, monkeypatch, meter if wired else None)
+        app = _app(verifier, meter=meter, resource_token_provider=provider)
+        first = await _post(app, "/v1/search", _signed_headers(agent, token, "/v1/search"))
+        assert first.status_code == 200
 
-    # The issuer revokes; the next request is refused with the plain challenge
-    # and, nothing being in flight, the FINAL record rides on it.
-    assert await meter.revoke(PS_ISS, "at-rv")
-    r = await _post(app, "/v1/search", _signed_headers(agent, token, "/v1/search"))
-    assert r.status_code == 401 and r.json()["code"] == "AUTH_TOKEN_REVOKED"
-    assert (r.headers["AAuth-Requirement"]
-            == 'requirement=auth-token;resource-token="resource.token.rv"')
-    assert "AAuth-Budget" not in r.headers
-    assert calls[-1] == {"jti": "at-rv", "consumed": 300}
+        await meter.record_revocation(PS_ISS, "at-rv", time.time() + 600)
+        r = await _post(app, "/v1/search", _signed_headers(agent, token, "/v1/search"))
+        assert r.status_code == 401, wired
+        assert r.headers["Signature-Error"] == "error=revoked_jwt"
+        assert r.headers["AAuth-Requirement"] == "requirement=person-token"
+        assert r.json()["error"] == "revoked_jwt"
+        assert r.json()["code"] == "AUTH_TOKEN_REVOKED"
+        assert "AAuth-Budget" not in r.headers
+        assert calls == []  # no resource token on the revoked challenge
+        # The final record is still there for the usage endpoint / audit view.
+        assert await meter.consumed_record(
+            (PS_ISS, "owner-1", RESOURCE), "at-rv") == {"jti": "at-rv", "consumed": 300}

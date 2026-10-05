@@ -34,7 +34,10 @@ __all__ = [
     "StaticKeyResolver",
     "build_aauth_budget_header",
     "build_aauth_requirement",
+    "build_person_token_requirement",
     "parse_signature_agent",
+    "parse_signature_input",
+    "parse_signature_key",
     "parse_signature_key_header",
 ]
 
@@ -120,18 +123,67 @@ def parse_signature_agent(value: str) -> str | None:
     return None
 
 
-def parse_signature_key_header(value: str) -> tuple[str, str] | None:
-    """``Signature-Key: sig=jwt;jwt="eyJ…"`` → (label, jwt) — the AAuth carrier."""
+def _plain(value: Any) -> Any:
+    """An sf-value as a plain Python value (Token/String → str, Integer → int)."""
+    if isinstance(value, (int, str, bool)):
+        return value
+    try:
+        inner = getattr(value, "value", value)
+        return inner if isinstance(inner, (int, str, bool)) else str(inner)
+    except Exception:  # noqa: BLE001
+        return str(value)
+
+
+def parse_signature_key(value: str) -> list[tuple[str, str, dict[str, Any]]]:
+    """``Signature-Key`` (draft-hardt-httpbis-signature-key) → one
+    ``(label, scheme, params)`` per member, in header order. The member's bare
+    item is the scheme token (``jwt``, ``jwks_uri``, ``hwk``, …); its parameters
+    are returned as plain values. Malformed header → ``[]``."""
+    out: list[tuple[str, str, dict[str, Any]]] = []
     try:
         node = SFDictionary()
         node.parse(value.encode())
         for label, member in node.items():
-            jwt_param = member.params.get("jwt")
-            if jwt_param:
-                return str(label), str(jwt_param)
+            scheme = _plain(getattr(member, "value", member))
+            params = {str(k): _plain(v) for k, v in member.params.items()}
+            out.append((str(label), str(scheme), params))
     except Exception:  # noqa: BLE001
-        return None
+        return []
+    return out
+
+
+def parse_signature_key_header(value: str) -> tuple[str, str] | None:
+    """``Signature-Key: sig=jwt;jwt="eyJ…"`` → (label, jwt) — the AAuth carrier.
+    Kept for callers of 0.6; :func:`parse_signature_key` sees every scheme."""
+    for label, scheme, params in parse_signature_key(value):
+        if scheme == "jwt" and params.get("jwt"):
+            return label, str(params["jwt"])
     return None
+
+
+def parse_signature_input(value: str) -> dict[str, tuple[list[str], dict[str, Any]]]:
+    """``Signature-Input`` (RFC 9421 §4.1) → ``{label: (covered components, params)}``.
+    Components come back as their identifiers (``@method``, ``content-digest``,
+    ``"signature-agent";key="agent2"`` → ``signature-agent``); params as plain values."""
+    out: dict[str, tuple[list[str], dict[str, Any]]] = {}
+    try:
+        node = SFDictionary()
+        node.parse(value.encode())
+        for label, member in node.items():
+            # An InnerList is a UserList of Items; a bare Item is not a valid member here.
+            items = list(member) if hasattr(member, "data") else []
+            covered = [str(_plain(getattr(item, "value", item))) for item in items]
+            params = {str(k): _plain(v) for k, v in member.params.items()}
+            out[str(label)] = (covered, params)
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
+def build_person_token_requirement() -> str:
+    """``AAuth-Requirement: requirement=person-token`` (-11 §6.4): what a resource
+    answers a revoked or expired auth token with. The header takes no parameters."""
+    return "requirement=person-token"
 
 
 # ── AAuth Budgets response headers (draft-hardt-aauth-budgets) ───────────────

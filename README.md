@@ -34,13 +34,20 @@ No FastAPI? The core has no framework dependencies:
 
 ```python
 verifier = HttpsigVerifier()
-sig = await verifier.verify(method, url, headers)   # VerifiedSignature | None
+sig = await verifier.verify(method, url, headers)            # VerifiedSignature | None
+out = await verifier.verify_detailed(method, url, headers, body)
+# VerifiedSignature | VerificationError(code="expired_jwt", …) | None
 ```
 
 Verification is **enrichment by default**: no `Signature` header costs nothing, a bad
-signature yields `None`, and nothing ever raises on untrusted input. Use
+signature yields `None`, and nothing ever raises on untrusted input. `verify_detailed()`
+says *why* with the `Signature-Error` code of draft-hardt-httpbis-signature-key exactly
+as AAuth -11 §11.3.4 assigns it (`invalid_signature`, `invalid_input`, `unsupported_scheme`,
+`unsupported_algorithm`, `invalid_key`, `unknown_key`, `issuer_missing`, `issuer_mismatch`,
+`invalid_jwt`, `expired_jwt`, `revoked_jwt`, `clock_skew`); `error.headers()` is the 401's
+header set and `error.problem()` its problem+json body. Use
 `regent_httpsig.fastapi.RequiredSignatureDep` when a signature must be present — the 401
-tells the agent exactly how to sign.
+carries that header, or `AAuth-Requirement: requirement=agent-token` when nothing was signed.
 
 > **Behind a reverse proxy?** The agent signed the *public* URL
 > (`https://api.example/…`), but your ASGI server sees `http://container/…`. The FastAPI
@@ -68,6 +75,18 @@ regent-httpsig keygen --agent https://myagent.example --out ./well-known/
 Publish the directory at `https://myagent.example/.well-known/http-message-signatures-directory`
 and every Web Bot Auth verifier on the internet can now identify your agent.
 
+The same key signs as an **AAuth agent** (-11 §11.3.3) — the token in `Signature-Key`,
+the required components covered, `Content-Digest` computed when there is a body:
+
+```python
+headers = signer.sign_aauth("POST", url, {"content-type": "application/json"},
+                            token=agent_token, body=raw_body)
+```
+
+and a **server** (a PS or AS calling a resource's usage or revocation endpoint, §11.3.2)
+signs under the `jwks_uri` scheme with `ServerSigner(seed=…, server_id="https://ps.example",
+dwk="aauth-person.json")` — publish `.jwks()` at your metadata document's `jwks_uri`.
+
 ## What exactly is verified
 
 | Check | Status |
@@ -76,7 +95,9 @@ and every Web Bot Auth verifier on the internet can now identify your agent.
 | Web Bot Auth draft -05 A.2.2 — sf-dictionary `Signature-Agent` covered with `;key=` | ✅ in CI¹ |
 | Web Bot Auth A.2.3 — legacy sf-string form (**what OpenAI ships in production**) | ✅ in CI |
 | Sign → verify roundtrip (fresh keys, full pipeline) | ✅ in CI |
-| AAuth identity-mode roundtrip (`aa-agent+jwt` + `cnf.jwk` proof of possession) | ✅ in CI |
+| AAuth -11 agent / person / auth tokens (`cnf.jwk` proof of possession, required components, body digest, 60 s `created` window, RS-51 token time, fully-specified algs, Ed25519 + ES256 possession keys) | ✅ in CI |
+| AAuth -11 server scheme (`jwks_uri` with `id`/`dwk`/`kid`, `issuer_mismatch`, key rotation refetch) | ✅ in CI |
+| Every -11 §11.3.4 Signature-Error code, `revoked_jwt` via the revocation record, RS-52 case-exact ids | ✅ in CI |
 | Signed by [`aauth-signing`](https://github.com/christian-posta/aauth-python-library) (jwt scheme, keyid-less) → verified | ✅² |
 | Tampered request / expired signature / wrong directory key rejected | ✅ in CI |
 
@@ -98,12 +119,16 @@ keyid-less shape is pinned in CI.
   `{Signature-Agent}/.well-known/http-message-signatures-directory`. Both wire forms of
   `Signature-Agent` are accepted — the current sf-dictionary and the legacy bare sf-string
   OpenAI actually sends.
-- **AAuth** (`draft-hardt-oauth-aauth-protocol`, identity-based mode): the agent carries a
-  JWT `agent_token` in `Signature-Key`; the issuer's JWKS verifies the token, the token's
-  `cnf.jwk` verifies the request signature. Install with `pip install 'regent-httpsig[aauth]'`.
-  Tracks the **-11 editor's copy**: fully-specified algorithms (RFC 9864, `Ed25519` — with a
-  transition flag for the -10 ecosystem's `EdDSA`) and **person tokens** (`aa-person+jwt`,
-  opt-in via `HttpsigConfig.resource_url`).
+- **AAuth** (`draft-hardt-oauth-aauth-protocol-11`): the agent carries its token in
+  `Signature-Key` under the `jwt` scheme — an agent token (`aa-agent+jwt`), a person token
+  (`aa-person+jwt`, opt-in via `HttpsigConfig.resource_url`) or an auth token
+  (`aa-auth+jwt`, pinned via `trusted_ps`); the issuer's JWKS, discovered through
+  `{iss}/.well-known/{dwk}`, verifies the token, the token's `cnf.jwk` verifies the request
+  signature. Servers sign under `jwks_uri` (`id`/`dwk`/`kid`). Install with
+  `pip install 'regent-httpsig[aauth]'`. 0.7.0 is the **-11 cut-over** — one dialect, as
+  published: fully-specified algorithms only (RFC 9864; `EdDSA` is refused), the required
+  covered components, the 60-second `created` window, no tolerance on `exp`, revoked tokens
+  named as revoked. `require_fully_specified_algs=False` survives for private test rigs only.
   For a full-protocol AAuth implementation (both roles, all token types) see
   [christian-posta/aauth-python-library](https://github.com/christian-posta/aauth-python-library) —
   this library is the thin relying-party verifier that handles both dialects.
@@ -144,14 +169,18 @@ production on [get4agent.com](https://get4agent.com).
 
 - `insufficient-budget` refusals carry **`required`** — the refused request's
   maximum cost — so the agent lowers its bound and retries instead of guessing.
-- **Revocation**: `make_revocation_endpoint(meter, authenticate_ps=…)` is the
-  base protocol's endpoint; a revoked token stops spending at once, in-flight
-  requests complete, and its final record rides on the next challenge.
-- An **expired** auth token gets the base protocol's plain challenge with a
-  resource token carrying that token's **final** consumption record — the
-  figure its issuer needs to settle the allocation (a record stated at or
-  after `exp` is final; one on a live token is a snapshot and releases
-  nothing).
+- **Revocation** (-11 §11.12): `make_revocation_endpoint(meter, authenticate_ps=…)`
+  takes the signed `POST {"jti", "exp"}`, keys the record by the caller's
+  verified identity, answers an empty `200` always (no 404) and problem+json
+  `invalid_request` / `unsupported_iss`. A revoked token stops spending at
+  once, in-flight requests complete, and a later presentation is answered
+  `401` + `Signature-Error: error=revoked_jwt` + `AAuth-Requirement:
+  requirement=person-token` — no resource token (§11.12.5). Wire
+  `HttpsigVerifier(is_revoked=meter.is_revoked)` so the verifier names it first.
+- An **expired** auth token is answered the same way with `expired_jwt`
+  (budgets editor's copy, 6 October): nothing is served or metered, and the
+  token's final consumption record reaches its issuer through the usage
+  endpoint, not on the challenge.
 - **Streaming** responses run in the draft's cost-omitted mode: `reserved` in
   the header, commit when the stream ends (set `request.state.budget_cost`
   mid-stream if you learn the actual), and the agent recovers the exact cost
@@ -163,11 +192,15 @@ production on [get4agent.com](https://get4agent.com).
 ```python
 from regent_httpsig import InMemoryMeter, ResponseSigner, make_usage_endpoint
 
+async def authenticate_ps(request):          # the PS signs as a server, §11.3.2
+    return await verifier.verify_server(request.method, str(request.url),
+                                        dict(request.headers), await request.body())
+
 handler = make_usage_endpoint(
     meter,
-    authenticate_ps=my_ps_authenticator,   # verify the PS's jwks_uri signature
+    authenticate_ps=authenticate_ps,
     unit="USD", decimals=6,
-    signer=ResponseSigner(seed=SEED, jwks_url="https://api.example/jwks.json"),
+    signer=ResponseSigner(seed=SEED, server_id="https://api.example"),  # dwk aauth-resource.json
 )
 
 @app.post("/usage")
@@ -211,9 +244,12 @@ from regent_httpsig import HttpsigConfig, HttpsigVerifier
 
 verifier = HttpsigVerifier(HttpsigConfig(
     trusted_agents=frozenset({"https://chatgpt.com", "https://operator.openai.com"}),
-    max_age_hours=25,       # reject signatures created earlier than this
-    cache_ttl=600,          # key-directory cache seconds
-))
+    max_age_hours=25,              # Web Bot Auth: reject signatures created earlier than this
+    signature_window_seconds=60,   # AAuth -11: the `created` window (advertise as signature_window)
+    resource_url="https://api.example",                    # accept person / auth tokens for us
+    trusted_ps={"https://ps.example": ""},                 # pinned issuers ("" = discover the JWKS)
+    cache_ttl=600,                 # key-directory cache seconds
+), is_revoked=meter.is_revoked)    # optional: name revoked tokens as revoked
 ```
 
 Pass your app's shared client to reuse its pool: `HttpsigVerifier(http_client=my_async_client)`.
@@ -222,9 +258,13 @@ Pass your app's shared client to reuse its pool: `HttpsigVerifier(http_client=my
 
 - Web Bot Auth and AAuth are **IETF drafts** (RFC 9421 itself is a final standard). We track
   the drafts; breaking draft changes land as minor releases while we're 0.x.
-- **Ed25519 only** for now — it's what the agent ecosystem ships.
-- Body coverage (`content-digest`) is verified when covered by the signature, but this
-  library does not require it; decide per-route whether you need it.
+- Web Bot Auth is **Ed25519 only** — it's what the agent ecosystem ships. AAuth
+  possession keys may be Ed25519 or P-256 (ES256); RS256 is accepted for issuer keys.
+- On the AAuth path a request with a body **must** cover `content-digest` and
+  `content-type` (-11 §11.3.3.1) and the digest is checked against the body you pass;
+  the FastAPI layer reads the body for you. Web Bot Auth keeps its per-route choice.
+- Not in 0.7.0: issuing person/resource tokens, missions, the `202` deferred
+  `requirement=auth-token`, federated mode — the PS half of the protocol.
 
 ## Related projects
 

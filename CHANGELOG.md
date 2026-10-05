@@ -1,5 +1,106 @@
 # Changelog
 
+## 0.7.0
+
+**AAuth -11 cut-over** (draft-hardt-oauth-aauth-protocol-11, published
+25 September 2026; Signature-Key -09; budgets editor's copy of 6 October). One
+dialect, as the editor asked: the -10 forms are gone, not kept behind a flag.
+Breaking for every AAuth signer and resource; Web Bot Auth is untouched.
+
+*Resource side (§11.3.4 — a typed answer for every refusal):*
+
+- **`HttpsigVerifier.verify_detailed()`** returns a `VerifiedSignature` or a
+  **`VerificationError`** carrying the Signature-Error code -11 assigns:
+  `invalid_signature`, `invalid_input` (+ `required_input`),
+  `unsupported_scheme` (+ `Accept-Signature-Scheme`), `unsupported_algorithm`
+  (+ `Accept-Signature-Alg`), `invalid_key`, `unknown_key`, `issuer_missing`,
+  `issuer_mismatch`, `invalid_jwt`, `expired_jwt`, `revoked_jwt`, `clock_skew`.
+  `error.headers()` is the 401's header set, `error.problem()` the
+  `application/problem+json` body (`type: urn:ietf:params:sig-error:<code>`).
+  `verify()` keeps its `None`-on-failure contract.
+- **Covered components are enforced** (§11.3.3.1): `@method @authority @path
+  signature-key`, plus `content-digest content-type` when the request has a
+  body — and the digest is checked against the body you pass. Missing
+  components are `invalid_input` with the full `required_input` list.
+- **`created` window** (§11.3.4 step 3): `HttpsigConfig.signature_window_seconds`
+  (default 60). Older than the window is `invalid_signature`; further ahead of
+  our clock is `clock_skew`; a past `expires` is `invalid_signature`. The
+  upstream library's 5-second skew rule no longer pre-empts these.
+- **RS-51 token time**: `exp` has no tolerance; `iat` is not a validity check
+  (only an `iat` beyond the window ahead is refused, as `clock_skew`); person
+  and auth tokens live at most **3600 s exactly** (the 90 s grace is gone);
+  `typ` is read first; an auth token's `dwk` must be `aauth-person.json` or
+  `aauth-access.json`.
+- **Fully-specified algorithms by default** (§11.3.1, RFC 9864):
+  `require_fully_specified_algs` is now `True`. The polymorphic `EdDSA` and a
+  `cnf.jwk` without `alg` are `unsupported_algorithm` with
+  `Accept-Signature-Alg: Ed25519, ES256, RS256`. A P-256 possession key
+  (ES256) now verifies. The flag stays only for private test rigs.
+- **The `jwks_uri` server scheme** (§11.3.2, Signature-Key §3.6):
+  `sig=jwks_uri;id="…";dwk="aauth-person.json";kid="…"` — the metadata
+  document at `{id}/.well-known/{dwk}` must name `issuer == id`
+  (`issuer_mismatch`), its `jwks_uri` is followed, the `kid` found (one
+  refetch on rotation, then `unknown_key`). `verify_server()` is the
+  entry point for usage and revocation endpoints; `trusted_ps` may pin a
+  JWKS URL or `""` to discover it.
+- **Revocation hook**: `HttpsigVerifier(is_revoked=meter.is_revoked)` — a
+  token the application has on record as revoked is answered `revoked_jwt`
+  (RS-43, §11.12.5), never "invalid" or "expired".
+- **RS-52**: agent identifiers compare exactly; no case folding (test pinned).
+
+*FastAPI layer:*
+
+- `RequiredSignatureDep` answers a failed signature with `401` +
+  `Signature-Error` (+ `Accept-Signature-*`, + `AAuth-Requirement:
+  requirement=person-token` for a revoked/expired person or auth token) and a
+  problem+json body; an unsigned request gets `AAuth-Requirement:
+  requirement=agent-token` (§6.1). New `SignatureErrorDep`,
+  `RequiredServerSignatureDep`, `signature_error_response()`.
+- `BudgetMiddleware`: a **revoked** auth token is `revoked_jwt` +
+  `requirement=person-token`, with **no resource token** (the PS would reject
+  one naming a revoked token) and no `AAuth-Budget`; an **expired** auth token
+  is `expired_jwt` + `requirement=person-token` the same way (budgets editor's
+  copy, 6 October). The 0.5.1 final-record challenge and
+  `allow_expired_auth_token` are removed — the final figure reaches the
+  issuer through the usage endpoint. Any other signed-but-failing request on
+  a priced route is refused with `Signature-Error` instead of being treated
+  as unsigned.
+
+*Revocation endpoint (RS-60, §11.12):*
+
+- `make_revocation_endpoint`: the body is **`{"jti", "exp"}`**; the issuer
+  comes from the caller's verified server signature, never from the body.
+  The pair is recorded whether or not the token was ever seen here; the
+  answer is always an empty `200` — **no 404**. Errors are problem+json:
+  `invalid_request` 400 (incl. `exp` beyond `max_token_lifetime` + skew),
+  `unsupported_iss` 403 (`accepted_issuers=` predicate), a failed signature
+  401 + `Signature-Error`.
+- `InMemoryMeter.record_revocation(iss, jti, exp)` and `is_revoked(iss, jti)`;
+  entries live until `exp` + 60 s. `revoke()` remains for tokens the meter
+  holds.
+- `make_usage_endpoint` / `make_revocation_endpoint` accept an
+  `authenticate_ps` that returns a `VerifiedSignature`, an issuer string, a
+  `VerificationError` or `None`; refusals are 401 + `Signature-Error`.
+
+*Signers:*
+
+- **`EgressSigner.sign_aauth(method, url, headers, token=…, body=…)`**: the
+  -11 agent signature — `Signature-Key: sig=jwt;jwt="…"`, the required
+  components (+ body components with a computed `Content-Digest`), `created`
+  only, no `keyid`. `EgressSigner.public_jwk` now carries `alg: Ed25519`
+  (RFC 9864) for `cnf.jwk`; the Web Bot Auth directory is unchanged.
+- **`ServerSigner(seed, server_id, dwk)`**: the jwks_uri scheme for a PS/AS
+  (or a resource) calling another server; `.jwks()` is what to publish.
+- **`ResponseSigner(seed, server_id, dwk="aauth-resource.json")`** emits the
+  -11 `Signature-Key` form; the `jwks_url` form is gone. Golden vectors
+  regenerated.
+- `sign_request()`, `content_digest()`, `parse_signature_key()`,
+  `parse_signature_input()`, `build_person_token_requirement()` exported.
+
+Dropped: `allow_expired_auth_token`, `VerifiedSignature.expired`,
+`EXPIRED_AUTH_TOKEN_GRACE`, `ResponseSigner(jwks_url=)`, the `{iss, jti}`
+revocation body, the 90 s lifetime grace, `EdDSA` by default.
+
 ## 0.6.0
 
 **Budgets — revocation reaches the meter** (base protocol §Token Revocation,
