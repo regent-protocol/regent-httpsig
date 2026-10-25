@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "regent-httpsig"
-version = "0.7.1"
+version = "0.7.2"
 description = "Verify and sign AI agent HTTP traffic in Python — RFC 9421 HTTP Message Signatures: Web Bot Auth (what OpenAI ships) and AAuth."
 readme = "README.md"
 license = "Apache-2.0"
@@ -29,7 +29,7 @@ dependencies = [
     "cryptography>=42",
     # typing_extensions: http-message-signatures 2.0.1 imports it but forgets to
     # declare it — we declare it so installs never break.
-    "http-message-signatures>=2.0.1",
+    "http-message-signatures>=2.0.1,<3",
     "typing_extensions>=4.10",
     "httpx>=0.25",
 ]

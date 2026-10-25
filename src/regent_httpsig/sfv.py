@@ -20,9 +20,15 @@ from http_message_signatures import (  # type: ignore[attr-defined]
     HTTPSignatureComponentResolver,
     HTTPSignatureKeyResolver,
     algorithms,
-    http_sfv,
 )
 from http_message_signatures.structures import CaseInsensitiveDict
+
+# http-message-signatures 2.1.0 (19.10.2026) dropped its vendored `http_sfv` module for the
+# `http-sf` package, whose `compat` module keeps the same parse()/params/value API.
+try:  # 2.1.0 and later
+    from http_sf import compat as http_sfv  # type: ignore[import-not-found,no-redef]
+except ImportError:  # 2.0.x
+    from http_message_signatures import http_sfv  # type: ignore[attr-defined,no-redef]
 
 __all__ = [
     "ED25519",
